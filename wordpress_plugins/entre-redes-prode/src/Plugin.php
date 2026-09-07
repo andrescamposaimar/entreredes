@@ -125,6 +125,24 @@ final class Plugin {
             $controller->register_routes();
         } );
 
+        // 2b. Never let a shared HTTP cache store a /prode/ response.
+        //
+        //     Every /prode/ payload is caller-specific: GET /prode/fecha-activa and
+        //     GET /prode/fecha/{id} embed the caller's own user_predictions, /prode/ranking
+        //     embeds their `me` row, and /prode/auth/* returns their tokens. Callers
+        //     authenticate with a Bearer token and send no WordPress session cookie, so a
+        //     URL-keyed reverse proxy that only bypasses on that cookie treats every
+        //     request as anonymous — and serves one user's predictions to everyone else
+        //     for the lifetime of the cache entry. Observed in production 2026-09-07:
+        //     an invalid Bearer token returned 200 with `x-cache-status: HIT` instead of 401.
+        //
+        //     The response header is the half we control from the plugin: it travels with
+        //     the code and survives a hosting, proxy or CDN change. Vary is declared too so
+        //     a cache that does key on request headers splits per token instead of ignoring
+        //     it. The upstream proxy must still be configured to honour this — the plugin
+        //     cannot force it, which is why the header is a floor and not the whole fix.
+        add_filter( 'rest_post_dispatch', [ self::class, 'denyProdeResponseCaching' ], 10, 3 );
+
         // 3. WP-CLI commands — guarded so the command class is only loaded in CLI context.
         if ( defined( 'WP_CLI' ) && WP_CLI ) {
             global $wpdb;
@@ -243,5 +261,44 @@ final class Plugin {
             false,
             dirname( plugin_basename( ENTRE_REDES_PRODE_FILE ) ) . '/languages'
         );
+    }
+
+    /**
+     * Mark every /entre-redes/v1/prode/ REST response as uncacheable.
+     *
+     * Registered on `rest_post_dispatch`. Responses outside the prode namespace are
+     * returned untouched, so the public read-only endpoints stay cacheable.
+     *
+     * `Vary: Authorization` is appended rather than replaced: WordPress already sets
+     * `Vary: Origin` for CORS, and WP_HTTP_Response::header() with $replace = false
+     * concatenates instead of overwriting.
+     *
+     * @param \WP_HTTP_Response|mixed $response Result to send to the client.
+     * @param \WP_REST_Server|mixed   $server   Server instance (unused).
+     * @param \WP_REST_Request|mixed  $request  Request used to generate the response.
+     * @return \WP_HTTP_Response|mixed
+     */
+    public static function denyProdeResponseCaching( $response, $server, $request ) {
+        // Duck-typed on purpose: rest_post_dispatch is documented to pass a
+        // WP_HTTP_Response, but anything carrying header() and get_route() is enough
+        // here — and it keeps the filter testable against a shim that does not model
+        // WordPress's response class hierarchy.
+        if ( ! is_object( $response ) || ! method_exists( $response, 'header' ) ) {
+            return $response;
+        }
+
+        if ( ! is_object( $request ) || ! method_exists( $request, 'get_route' ) ) {
+            return $response;
+        }
+
+        if ( ! str_starts_with( (string) $request->get_route(), '/entre-redes/v1/prode/' ) ) {
+            return $response;
+        }
+
+        $response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0, private' );
+        $response->header( 'Pragma', 'no-cache' );
+        $response->header( 'Vary', 'Authorization', false );
+
+        return $response;
     }
 }

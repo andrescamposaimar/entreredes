@@ -471,6 +471,7 @@ if ( ! class_exists( 'WP_REST_Request' ) ) {
         private array $headers = [];
         /** @var array<string, mixed> */
         private array $params = [];
+        private string $route = '';
 
         public function set_header( string $name, string $value ): void {
             $this->headers[ strtolower( $name ) ] = $value;
@@ -486,6 +487,14 @@ if ( ! class_exists( 'WP_REST_Request' ) ) {
 
         public function get_param( string $name ): mixed {
             return $this->params[ $name ] ?? null;
+        }
+
+        public function set_route( string $route ): void {
+            $this->route = $route;
+        }
+
+        public function get_route(): string {
+            return $this->route;
         }
     }
 }
@@ -532,6 +541,8 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
     class WP_REST_Response {
         private mixed $data;
         private int $status;
+        /** @var array<string, string> */
+        private array $headers = [];
 
         public function __construct( mixed $data = null, int $status = 200 ) {
             $this->data   = $data;
@@ -544,6 +555,23 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
 
         public function get_status(): int {
             return $this->status;
+        }
+
+        /**
+         * Mirrors WP_HTTP_Response::header(): $replace = false concatenates
+         * onto the existing value with ', ' instead of overwriting it.
+         */
+        public function header( string $key, string $value, bool $replace = true ): void {
+            if ( $replace || ! isset( $this->headers[ $key ] ) ) {
+                $this->headers[ $key ] = $value;
+            } else {
+                $this->headers[ $key ] .= ', ' . $value;
+            }
+        }
+
+        /** @return array<string, string> */
+        public function get_headers(): array {
+            return $this->headers;
         }
     }
 }
