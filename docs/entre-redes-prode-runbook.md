@@ -138,12 +138,37 @@ To preserve data, deactivate the plugin without deleting it. All tables and data
 
 ## 8. Upgrading the plugin
 
-1. Download the new version ZIP.
-2. Deactivate the current plugin.
-3. Delete the plugin (WP will NOT run uninstall.php if you bypass it by uploading a new version; see step 4).
-4. Upload and install the new ZIP.
-5. **Do not activate yet** — run `composer install --no-dev --optimize-autoloader` in the plugin directory.
-6. Activate. The MigrationRunner will detect the version mismatch and run dbDelta to apply any new columns or indexes. Existing data is preserved.
+> **NEVER click Delete to upgrade.** Deleting the plugin from the WordPress admin
+> runs `uninstall.php`, which **drops all 10 `wp_prode_*` tables** — every user,
+> prediction, score and ranking, permanently. §7 describes that path correctly.
+> A previous revision of this section instructed operators to delete the plugin
+> and claimed WordPress would skip `uninstall.php`. That claim was wrong.
+> Use the replace flow below, which never invokes the uninstall hook.
+
+1. Build the ZIP: `./wordpress_plugins/build-prode.sh --with-dev`
+   (the script vendors production dependencies into the artifact and refuses to
+   package a tree that would ship without them — see §6. `--with-dev` restores
+   phpunit afterwards so the test suite still runs locally.)
+2. WordPress admin → **Plugins → Add New → Upload Plugin**, select the ZIP.
+3. WordPress detects the installed copy and shows a side-by-side comparison of
+   the current and uploaded versions. Click **Replace current with uploaded**.
+   This deactivates, swaps the files and reactivates. It does **not** call
+   `uninstall.php`, so all data is preserved.
+4. No `composer install` step is needed: the ZIP already contains `vendor/`.
+   (Only relevant if you deploy by unzipping by hand instead of using §6.)
+5. On activation the MigrationRunner compares `prode_db_version` against
+   `ENTRE_REDES_PRODE_VERSION` and runs `InitialSchema::up()` when they differ.
+   That path is idempotent (`dbDelta` plus `INSERT IGNORE`), so it adds new
+   columns and indexes without touching existing rows or settings. Crons are
+   rescheduled on every activation, not only on a version bump.
+6. Verify the deployed version before you walk away:
+   `curl -s https://<site>/wp-json/entre-redes/v1/healthcheck`
+   The reported `version` must match the ZIP you just uploaded. A stale version
+   here means the replace did not take.
+
+**Bumping the version matters.** `build-prode.sh` reads `Version:` from
+`entre-redes-prode.php`, and MigrationRunner gates schema updates on it. Shipping
+a changed plugin under an unchanged version number means the migration never runs.
 
 ---
 
@@ -170,4 +195,4 @@ To preserve data, deactivate the plugin without deleting it. All tables and data
 
 ---
 
-*Last updated: 2026-05-25 — PR-01 (plugin scaffold)*
+*Last updated: 2026-09-07 — corrected §8: the upgrade path no longer tells operators to delete the plugin (which drops every table via uninstall.php).*
