@@ -120,6 +120,86 @@ class FechaRepositoryTest extends TestCase {
         $this->assertSame( 2, $this->countFechaMatches() );
     }
 
+    // -------------------------------------------------------------------------
+    // upsertFecha — reuse branch recomputes locked_at (locked_at drift fix)
+    // -------------------------------------------------------------------------
+
+    public function test_second_upsert_same_play_date_updates_locked_at_when_still_open(): void {
+        // The operator changes lock_hours_before between the two seed runs.
+        // Because the fecha is still genuinely open (now < locked_at), the
+        // reused row must pick up the recomputed locked_at.
+        $tenantId = 'test_tenant';
+        $seasonId = 359;
+        $matches  = $this->sampleMatches();
+
+        $firstId = $this->repo->upsertFecha( $tenantId, $seasonId, '2099-01-01 00:00:00', $matches );
+        $this->assertSame( '2099-01-01 00:00:00', $this->fetchLockedAt( $firstId ) );
+
+        $secondId = $this->repo->upsertFecha( $tenantId, $seasonId, '2099-02-01 00:00:00', $matches );
+
+        $this->assertSame( $firstId, $secondId );
+        $this->assertSame( '2099-02-01 00:00:00', $this->fetchLockedAt( $firstId ) );
+    }
+
+    public function test_second_upsert_does_not_move_locked_at_of_an_already_locked_fecha(): void {
+        // 'locked' is never persisted as a state (see FechaRepository docblock) —
+        // a fecha can be state='open' in the DB while already effectively locked
+        // because now >= locked_at. A reseed attempt (e.g. a cron re-run) must
+        // NOT push locked_at into the future and retroactively re-open it.
+        $tenantId = 'test_tenant';
+        $seasonId = 359;
+        $matches  = $this->sampleMatches();
+
+        $firstId = $this->repo->upsertFecha( $tenantId, $seasonId, '2000-01-01 00:00:00', $matches );
+        $this->assertSame( '2000-01-01 00:00:00', $this->fetchLockedAt( $firstId ) );
+
+        // Attempt to push locked_at far into the future.
+        $secondId = $this->repo->upsertFecha( $tenantId, $seasonId, '2099-12-31 23:59:00', $matches );
+
+        $this->assertSame( $firstId, $secondId );
+        $this->assertSame(
+            '2000-01-01 00:00:00',
+            $this->fetchLockedAt( $firstId ),
+            'locked_at of an already-locked fecha must never move.'
+        );
+    }
+
+    public function test_maybe_refresh_locked_at_skips_evaluated_fechas(): void {
+        // Defence in depth: findExistingFechaId already excludes 'evaluated'
+        // fechas from the reuse path, but the guard itself must independently
+        // refuse to touch an evaluated fecha's locked_at.
+        global $wpdb;
+        $p = $wpdb->prefix;
+
+        $wpdb->insert( $p . 'prode_fechas', [
+            'tenant_id'    => 'test_tenant',
+            'season_id'    => 359,
+            'locked_at'    => '2026-01-01 00:00:00',
+            'state'        => 'evaluated',
+            'created_at'   => '2025-12-01 00:00:00',
+            'evaluated_at' => '2026-01-02 00:00:00',
+        ] );
+        $fechaId = (int) $wpdb->insert_id;
+
+        // setAccessible() is a no-op since PHP 8.1 and deprecated in 8.5 — invoke()
+        // works on private methods directly (mirrors PredictionsListTableTest).
+        $method = new \ReflectionMethod( FechaRepository::class, 'maybeRefreshLockedAt' );
+        $method->invoke( $this->repo, $wpdb, $p, $fechaId, '2099-01-01 00:00:00' );
+
+        $this->assertSame( '2026-01-01 00:00:00', $this->fetchLockedAt( $fechaId ) );
+    }
+
+    /** Fetch the persisted locked_at for a fecha id. */
+    private function fetchLockedAt( int $fechaId ): string {
+        global $wpdb;
+        return (string) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT locked_at FROM {$wpdb->prefix}prode_fechas WHERE id = %d",
+                $fechaId
+            )
+        );
+    }
+
     public function test_upsert_different_play_date_creates_new_fecha_row(): void {
         $tenantId  = 'test_tenant';
         $seasonId  = 359;

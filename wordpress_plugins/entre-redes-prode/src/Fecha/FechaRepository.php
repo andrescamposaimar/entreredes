@@ -59,6 +59,7 @@ class FechaRepository {
 
         if ( null !== $existingId ) {
             $fechaId = $existingId;
+            $this->maybeRefreshLockedAt( $wpdb, $p, $fechaId, $lockedAt );
         } else {
             // Step 2: insert a new prode_fechas row.
             $wpdb->insert(
@@ -397,6 +398,64 @@ class FechaRepository {
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Recompute locked_at for a REUSED fecha from the current lock setting +
+     * earliest kickoff — but only when it is safe to do so.
+     *
+     * Why this exists: upsertFecha used to snapshot locked_at only on the
+     * initial INSERT. If the operator later changed lock_hours_before, every
+     * already-seeded fecha kept its stale locked_at forever — the setting had
+     * no effect until the NEXT brand-new fecha was created. That silently
+     * surprised an operator in production who expected the change to apply
+     * immediately.
+     *
+     * Both guards below must hold, or the update is skipped entirely:
+     *
+     *   1. Persisted state must be 'open'. A fecha that reached 'evaluated' is
+     *      done; its locked_at is historical record and must never move.
+     *
+     *   2. now must still be BEFORE the fecha's CURRENT locked_at. 'locked' is
+     *      never persisted as a state (mirrors LockComputer::deriveState) — it
+     *      is derived at read time by comparing now against locked_at. So a
+     *      persisted state of 'open' does NOT guarantee the fecha hasn't
+     *      already effectively locked. If now >= the current locked_at, the
+     *      fecha is already locked in practice, and pushing locked_at forward
+     *      — even by a little — would retroactively re-open predictions for a
+     *      fecha the app has already told users is closed. That would be a
+     *      worse surprise than the stale-setting bug this fix addresses, so we
+     *      only ever move locked_at while the fecha is still genuinely open.
+     *
+     * The UPDATE re-checks `state = 'open'` in its WHERE clause (not just id)
+     * as a defensive guard against a concurrent lock-derivation race between
+     * the SELECT above and this UPDATE.
+     */
+    private function maybeRefreshLockedAt( \wpdb $wpdb, string $p, int $fechaId, string $newLockedAt ): void {
+        $current = $wpdb->get_row(
+            $wpdb->prepare(
+                "SELECT state, locked_at FROM {$p}prode_fechas WHERE id = %d LIMIT 1",
+                $fechaId
+            ),
+            ARRAY_A
+        );
+
+        if ( empty( $current ) || 'open' !== $current['state'] ) {
+            return;
+        }
+
+        $now = current_time( 'mysql' );
+        if ( $now >= $current['locked_at'] ) {
+            // Already effectively locked (the state column just hasn't caught
+            // up) — never move locked_at, forward or backward.
+            return;
+        }
+
+        $wpdb->update(
+            $p . 'prode_fechas',
+            [ 'locked_at' => $newLockedAt ],
+            [ 'id' => $fechaId, 'state' => 'open' ]
+        );
+    }
 
     /**
      * Look for a non-evaluated fecha whose matches have MIN(match_kickoff) date

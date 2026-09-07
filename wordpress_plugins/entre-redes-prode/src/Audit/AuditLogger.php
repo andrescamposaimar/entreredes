@@ -35,6 +35,21 @@ namespace EntreRedes\Prode\Audit;
  *   user_account_deletion
  *     Mandatory: user_id, dni_hash (from the about-to-be-soft-deleted association)
  *     Actor: "self"
+ *
+ *   prediction_submitted
+ *     Mandatory: user_id
+ *     Optional metadata: fecha_id, match_id, score_home, score_away, operation ("insert"|"update")
+ *     Actor: "self"
+ *     No DNI involved — a prediction is not secret from the user who made it,
+ *     but the row still carries user_id (never a raw DNI) for consistency
+ *     with every other event type.
+ *
+ *   prediction_rejected
+ *     Mandatory: user_id, reason ("missing_field"|"invalid_score"|"match_not_found"|"fecha_locked")
+ *     Optional metadata: fecha_id, match_id, score_home, score_away (whatever
+ *       was present/parseable in the request at rejection time; absent or
+ *       unparsed fields are recorded as null rather than guessed at)
+ *     Actor: "self"
  */
 class AuditLogger {
 
@@ -169,6 +184,85 @@ class AuditLogger {
             $fields['provider'] = $provider;
         }
         $this->insert( 'user_account_deletion', $fields );
+    }
+
+    /**
+     * Logs an accepted prediction write (either a first-time INSERT or an
+     * UPDATE of an existing prediction).
+     *
+     * No DNI is involved or logged here — predictions are not secret from the
+     * user themselves (unlike DNI association, which the DniHasher protects),
+     * so only user_id (never a raw DNI) identifies the actor, consistent with
+     * the privacy posture of every other event type in this class.
+     *
+     * @param int  $userId    prode_users.id of the predicting user.
+     * @param int  $fechaId   prode_fechas.id the prediction belongs to.
+     * @param int  $matchId   Match identifier.
+     * @param int  $scoreHome Submitted home score.
+     * @param int  $scoreAway Submitted away score.
+     * @param bool $wasInsert True for a first-time prediction (INSERT); false on UPDATE.
+     */
+    public function logPredictionSubmitted(
+        int $userId,
+        int $fechaId,
+        int $matchId,
+        int $scoreHome,
+        int $scoreAway,
+        bool $wasInsert
+    ): void {
+        $this->insert( 'prediction_submitted', [
+            'user_id'       => $userId,
+            'actor'         => 'self',
+            'metadata_json' => json_encode( [
+                'fecha_id'   => $fechaId,
+                'match_id'   => $matchId,
+                'score_home' => $scoreHome,
+                'score_away' => $scoreAway,
+                'operation'  => $wasInsert ? 'insert' : 'update',
+            ] ),
+        ] );
+    }
+
+    /**
+     * Logs a rejected prediction write attempt.
+     *
+     * Covers every rejection path in PredictionController::submitPrediction():
+     *   400 missing_field   — a required field was absent from the request body.
+     *   400 invalid_score   — score_home/score_away out of [0, 255] or non-integer.
+     *   400 match_not_found — fecha_id/match_id do not resolve to an active fecha.
+     *   423 fecha_locked    — the fecha's locked_at has already passed.
+     *
+     * Values are recorded as-received (mixed): a field that was missing or
+     * failed validation is passed through as whatever the caller had at hand
+     * (often null) rather than coerced, so the log tells the operator the
+     * field was genuinely absent/invalid, not a guessed default.
+     *
+     * @param int    $userId    prode_users.id of the requesting user.
+     * @param string $reason    One of: missing_field | invalid_score | match_not_found | fecha_locked.
+     * @param mixed  $fechaId   Submitted fecha_id, raw or cast depending on how far validation got.
+     * @param mixed  $matchId   Submitted match_id, raw or cast depending on how far validation got.
+     * @param mixed  $scoreHome Submitted score_home, raw or cast.
+     * @param mixed  $scoreAway Submitted score_away, raw or cast.
+     */
+    public function logPredictionRejected(
+        int $userId,
+        string $reason,
+        mixed $fechaId,
+        mixed $matchId,
+        mixed $scoreHome,
+        mixed $scoreAway
+    ): void {
+        $this->insert( 'prediction_rejected', [
+            'user_id'       => $userId,
+            'actor'         => 'self',
+            'metadata_json' => json_encode( [
+                'reason'     => $reason,
+                'fecha_id'   => $fechaId,
+                'match_id'   => $matchId,
+                'score_home' => $scoreHome,
+                'score_away' => $scoreAway,
+            ] ),
+        ] );
     }
 
     // -------------------------------------------------------------------------

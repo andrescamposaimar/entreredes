@@ -73,7 +73,8 @@ final class Plugin {
             $prediction_controller = new Rest\PredictionController(
                 $pred_repo,
                 $fecha_repo,
-                $middleware
+                $middleware,
+                new Audit\AuditLogger()
             );
 
             // G3: admin endpoint for manual fecha evaluation (ADR-G3-4).

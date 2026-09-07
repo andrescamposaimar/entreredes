@@ -144,6 +144,74 @@ class SettingsRepositoryTest extends TestCase {
     }
 
     // -------------------------------------------------------------------------
+    // upsertSetting — no-op when the value is unchanged (updated_at drift fix)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Regression guard: SettingsPage::handleSaveSettings() re-upserts EVERY
+     * editable key on every Save click, even when the operator only changed
+     * one field. upsertSetting() used to restamp updated_at unconditionally,
+     * so a single Save click destroyed the ability to tell WHEN a setting had
+     * actually last changed — this actively misled a production investigation.
+     */
+    public function test_upsertSetting_does_not_restamp_updated_at_when_value_is_unchanged(): void {
+        global $wpdb;
+        $p = $wpdb->prefix;
+
+        $original = '2020-01-01 00:00:00';
+        $wpdb->insert(
+            $p . 'prode_settings',
+            [
+                'setting_key'   => 'lock_hours_before',
+                'setting_value' => '24',
+                'updated_at'    => $original,
+                'updated_by'    => 5,
+            ]
+        );
+
+        // Same value, different actor — simulates any operator clicking Save
+        // without touching this field.
+        $result = $this->repo->upsertSetting( 'lock_hours_before', '24', 9 );
+
+        $this->assertTrue( $result );
+
+        $row = $wpdb->get_row(
+            "SELECT setting_value, updated_at, updated_by FROM {$p}prode_settings WHERE setting_key = 'lock_hours_before'",
+            ARRAY_A
+        );
+        $this->assertSame( '24', $row['setting_value'] );
+        $this->assertSame( $original, $row['updated_at'], 'updated_at must not move when the value did not change.' );
+        $this->assertSame( '5', (string) $row['updated_by'], 'updated_by must not move either — no real change happened.' );
+    }
+
+    public function test_upsertSetting_still_restamps_updated_at_when_value_changes(): void {
+        global $wpdb;
+        $p = $wpdb->prefix;
+
+        $wpdb->insert(
+            $p . 'prode_settings',
+            [
+                'setting_key'   => 'lock_hours_before',
+                'setting_value' => '24',
+                'updated_at'    => '2020-01-01 00:00:00',
+                'updated_by'    => 5,
+            ]
+        );
+
+        $result = $this->repo->upsertSetting( 'lock_hours_before', '48', 9 );
+
+        $this->assertTrue( $result );
+
+        $row = $wpdb->get_row(
+            "SELECT setting_value, updated_at, updated_by FROM {$p}prode_settings WHERE setting_key = 'lock_hours_before'",
+            ARRAY_A
+        );
+        $this->assertSame( '48', $row['setting_value'] );
+        $this->assertNotSame( '2020-01-01 00:00:00', $row['updated_at'], 'A real value change must still restamp updated_at.' );
+        $this->assertSame( '9', (string) $row['updated_by'] );
+    }
+
+    // -------------------------------------------------------------------------
     // getProviderOptions — CONF-02, CONF-03: constant flag when defined
     // -------------------------------------------------------------------------
 

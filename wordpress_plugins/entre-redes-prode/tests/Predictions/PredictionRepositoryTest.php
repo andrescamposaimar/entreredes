@@ -112,6 +112,19 @@ class PredictionRepositoryTest extends TestCase {
         $this->assertSame( 1, $this->countPredictions() );
     }
 
+    /**
+     * The return value tells the caller (PredictionController's audit log)
+     * whether the write was a first-time INSERT or an UPDATE of an existing
+     * prediction.
+     */
+    public function test_upsert_returns_true_on_insert_and_false_on_update(): void {
+        $wasInsert = $this->repo->upsert( 1, 10, 5, 2, 1, '2026-06-01 10:00:00' );
+        $this->assertTrue( $wasInsert );
+
+        $wasInsert = $this->repo->upsert( 1, 10, 5, 3, 0, '2026-06-01 10:00:00' );
+        $this->assertFalse( $wasInsert );
+    }
+
     public function test_upsert_sets_correct_scores_and_derived_result_on_insert(): void {
         $this->repo->upsert(
             userId:            1,
@@ -215,6 +228,55 @@ class PredictionRepositoryTest extends TestCase {
 
         $row = $this->fetchRow( 1, 5 );
         $this->assertSame( '2026-06-02 10:00:00', $row['locked_at_snapshot'] );
+    }
+
+    // -------------------------------------------------------------------------
+    // upsert — fecha_id must follow the row on re-upsert (latent-trap fix)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Regression test for the "postponed match re-seeded into a later fecha"
+     * trap: prode_predictions' UNIQUE is (user_id, match_id) only — the same
+     * match_id can legitimately belong to two different fechas over time (the
+     * uq_fecha_match unique key on prode_fecha_matches is (fecha_id,
+     * match_id), which permits it). Before this fix, upsert()'s UPDATE branch
+     * never touched fecha_id, so a prediction made for the SAME match under a
+     * NEW fecha silently stayed attributed to the OLD fecha_id — invisible to
+     * findByUserAndFecha() and FechaEvaluator (both filter by fecha_id), i.e.
+     * the user's new prediction (and its points) vanished.
+     *
+     * Trade-off documented on the fix itself: because the row's identity is
+     * still (user_id, match_id), only ONE fecha can "own" a user's prediction
+     * for a given match_id at a time. This closes the invisible-prediction
+     * trap (the row now always reflects the fecha it was LAST written under)
+     * without changing the schema.
+     */
+    public function test_upsert_after_match_reseeded_into_new_fecha_updates_fecha_id(): void {
+        // First prediction, under the original fecha.
+        $this->repo->upsert( 1, 10, 5, 2, 1, '2026-06-01 10:00:00' );
+
+        // The match gets postponed and re-seeded into a later fecha; the user
+        // predicts again for the same match_id, now under fecha 20.
+        $this->repo->upsert( 1, 20, 5, 0, 0, '2026-06-08 10:00:00' );
+
+        // Still exactly one row: UNIQUE is (user_id, match_id).
+        $this->assertSame( 1, $this->countPredictions() );
+
+        $row = $this->fetchRow( 1, 5 );
+        $this->assertSame(
+            20,
+            (int) $row['fecha_id'],
+            'fecha_id must follow the latest write, or the prediction becomes invisible under the new fecha.'
+        );
+
+        // The prediction must now be retrievable under the NEW fecha...
+        $underNewFecha = $this->repo->findByUserAndFecha( 20, 1 );
+        $this->assertCount( 1, $underNewFecha );
+        $this->assertSame( 5, (int) $underNewFecha[0]['match_id'] );
+
+        // ...and NOT still stuck under the old one.
+        $underOldFecha = $this->repo->findByUserAndFecha( 10, 1 );
+        $this->assertCount( 0, $underOldFecha );
     }
 
     // -------------------------------------------------------------------------

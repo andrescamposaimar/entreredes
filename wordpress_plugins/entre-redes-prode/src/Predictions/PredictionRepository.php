@@ -63,6 +63,9 @@ class PredictionRepository {
      * @param int    $scoreHome        Predicted home score [0, 255].
      * @param int    $scoreAway        Predicted away score [0, 255].
      * @param string $lockedAtSnapshot The prode_fechas.locked_at value snapshotted at write time.
+     * @return bool True when a new row was INSERTed; false when an existing row was UPDATEd.
+     *              Callers (e.g. PredictionController) use this to log whether a
+     *              submission was a first-time prediction or a change to one.
      */
     public function upsert(
         int $userId,
@@ -71,7 +74,7 @@ class PredictionRepository {
         int $scoreHome,
         int $scoreAway,
         string $lockedAtSnapshot
-    ): void {
+    ): bool {
         $wpdb   = $this->wpdb;
         $p      = $wpdb->prefix;
         $result = $this->deriveResult( $scoreHome, $scoreAway );
@@ -108,9 +111,31 @@ class PredictionRepository {
             );
         } else {
             // Step 2b: row exists — UPDATE (created_at intentionally excluded).
+            //
+            // fecha_id IS updated here (unlike created_at): the UNIQUE key on
+            // this table is (user_id, match_id) only, while prode_fecha_matches'
+            // UNIQUE is (fecha_id, match_id) — the schema permits the SAME
+            // match_id to belong to two different fechas over time (e.g. a
+            // postponed match re-seeded into a later fecha). Before this fix,
+            // a prediction re-submitted for that match under the NEW fecha
+            // silently stayed attributed to the OLD fecha_id here, making it
+            // invisible to findByUserAndFecha() and FechaEvaluator (both
+            // filter by fecha_id) — the user's new prediction, and its points,
+            // vanished.
+            //
+            // Trade-off: because the row's identity is still (user_id,
+            // match_id), only ONE fecha can "own" a user's prediction for a
+            // given match_id at a time — the row always reflects whichever
+            // fecha it was LAST written under. If the same match_id were ever
+            // concurrently active in two open fechas, the row would follow
+            // whichever upsert happened last rather than existing under both.
+            // That scenario has not occurred in production; fixing it would
+            // require changing the UNIQUE key to (user_id, fecha_id, match_id),
+            // which is a schema change out of scope here.
             $wpdb->update(
                 $p . 'prode_predictions',
                 [
+                    'fecha_id'           => $fechaId,
                     'result'             => $result,
                     'score_home'         => $scoreHome,
                     'score_away'         => $scoreAway,
@@ -122,6 +147,8 @@ class PredictionRepository {
         }
 
         $wpdb->query( 'COMMIT' );
+
+        return null === $existingId;
     }
 
     /**

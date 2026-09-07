@@ -360,7 +360,14 @@ if ( ! function_exists( 'wp_generate_password' ) ) {
 // ─── WP hook shims (no-ops) ───────────────────────────────────────────────────
 
 if ( ! function_exists( 'add_action' ) ) {
+    /**
+     * Records the callback (unlike a pure no-op) so tests can invoke deferred
+     * hooks — e.g. admin_notices closures registered by InitialSchema /
+     * MigrationRunner — the same way WordPress would when rendering wp-admin.
+     * do_action() below fires them; did_action()'s counter is unaffected.
+     */
     function add_action( string $tag, callable $fn, int $priority = 10, int $accepted_args = 1 ): true {
+        $GLOBALS['_prode_test_action_callbacks'][ $tag ][] = $fn;
         return true;
     }
 }
@@ -370,6 +377,9 @@ if ( ! function_exists( 'do_action' ) ) {
 
     function do_action( string $tag, mixed ...$args ): void {
         $GLOBALS['_prode_test_actions'][ $tag ] = ( $GLOBALS['_prode_test_actions'][ $tag ] ?? 0 ) + 1;
+        foreach ( $GLOBALS['_prode_test_action_callbacks'][ $tag ] ?? [] as $fn ) {
+            $fn( ...$args );
+        }
     }
 }
 

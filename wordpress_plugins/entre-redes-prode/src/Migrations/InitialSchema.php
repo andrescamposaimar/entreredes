@@ -78,6 +78,7 @@ class InitialSchema {
         }
 
         self::ensureActiveDniIndex( $p );
+        self::ensureAuditEventTypes( $p );
         self::seedSettings( $p );
 
         return $results;
@@ -123,12 +124,114 @@ class InitialSchema {
         }
 
         // phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-        $wpdb->query(
+        $ok = $wpdb->query(
             "ALTER TABLE {$table}
                 ADD COLUMN active_dni VARCHAR(20)
                     GENERATED ALWAYS AS (CASE WHEN deleted_at IS NULL THEN dni END) STORED,
                 ADD UNIQUE KEY uq_tenant_active_dni (tenant_id, active_dni)"
         );
+
+        if ( false === $ok ) {
+            // The ALTER can fail — most likely because duplicate active DNIs
+            // already exist in prode_users (data predating this constraint).
+            // The `if column exists -> return` guard above means a silently
+            // swallowed failure here would retry, and fail, on every single
+            // request forever with zero signal to the operator: the DB-level
+            // uniqueness guarantee would simply never exist. Surface it the
+            // same way assertInnoDB() does (deferred admin_notices), and do
+            // NOT throw/abort activation — dbDelta already created the
+            // tables, and the app still functions on the application-level
+            // conflict check alone, just without the DB-level backstop.
+            $error = (string) $wpdb->last_error;
+            add_action( 'admin_notices', function () use ( $error ) {
+                echo '<div class="notice notice-error"><p>';
+                printf(
+                    esc_html__(
+                        'Entre Redes Prode: could not create the unique active-DNI index (uq_tenant_active_dni), likely because duplicate active DNIs already exist in prode_users. The database-level "one active account per DNI" guarantee is NOT active until this is resolved. Error: %s',
+                        'entre-redes-prode'
+                    ),
+                    esc_html( $error )
+                );
+                echo '</p></div>';
+            } );
+        }
+    }
+
+    /**
+     * Guarantee prode_audit_log.event_type accepts the prediction event values.
+     *
+     * Why this is not left to dbDelta: dbDelta compares column definitions as
+     * text and is unreliable about ALTERing an existing ENUM in place. If it
+     * silently skips the change, MySQL rejects every INSERT carrying
+     * 'prediction_submitted' or 'prediction_rejected' — and AuditLogger::insert()
+     * uses $wpdb->insert(), which returns false rather than throwing. The
+     * prediction write itself still succeeds (the audit call runs after it), so
+     * the only visible symptom would be an audit log that stays empty while the
+     * operator believes predictions are being recorded.
+     *
+     * That failure mode is precisely what the audit log exists to prevent, so it
+     * is checked explicitly here rather than assumed. Idempotent: reads the live
+     * column type first and only issues the ALTER when a value is missing. A
+     * no-op on the non-MySQL test shim (no information_schema → null).
+     */
+    private static function ensureAuditEventTypes( string $p ): void {
+        global $wpdb;
+
+        $table = $p . 'prode_audit_log';
+
+        $columnType = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+            $wpdb->prepare(
+                "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+                  WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME   = %s
+                    AND COLUMN_NAME  = 'event_type'",
+                $table
+            )
+        );
+
+        // null → no information_schema (non-MySQL shim) or table absent: skip.
+        if ( null === $columnType ) {
+            return;
+        }
+
+        $required = [ 'prediction_submitted', 'prediction_rejected' ];
+        $missing  = array_filter(
+            $required,
+            static fn( string $value ): bool => ! str_contains( (string) $columnType, "'{$value}'" )
+        );
+
+        if ( empty( $missing ) ) {
+            return;
+        }
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+        $ok = $wpdb->query(
+            "ALTER TABLE {$table}
+                MODIFY COLUMN event_type ENUM(
+                    'association_created',
+                    'association_rejected_dni_not_found',
+                    'association_rejected_already_associated',
+                    'admin_unlink',
+                    'user_account_deletion',
+                    'prediction_submitted',
+                    'prediction_rejected'
+                ) NOT NULL"
+        );
+
+        if ( false === $ok ) {
+            $error = (string) $wpdb->last_error;
+            add_action( 'admin_notices', function () use ( $error ) {
+                echo '<div class="notice notice-error"><p>';
+                printf(
+                    esc_html__(
+                        'Entre Redes Prode: could not extend prode_audit_log.event_type with the prediction event values. Prediction submissions and rejections are NOT being recorded in the audit log, even though predictions themselves are saved normally. Error: %s',
+                        'entre-redes-prode'
+                    ),
+                    esc_html( $error )
+                );
+                echo '</p></div>';
+            } );
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -324,7 +427,7 @@ class InitialSchema {
     private static function sqlProdeAuditLog( string $p, string $charset ): string {
         return "CREATE TABLE {$p}prode_audit_log (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  event_type ENUM('association_created','association_rejected_dni_not_found','association_rejected_already_associated','admin_unlink','user_account_deletion') NOT NULL,
+  event_type ENUM('association_created','association_rejected_dni_not_found','association_rejected_already_associated','admin_unlink','user_account_deletion','prediction_submitted','prediction_rejected') NOT NULL,
   tenant_id VARCHAR(64) NOT NULL,
   player_id BIGINT UNSIGNED NULL DEFAULT NULL,
   player_name VARCHAR(255) NULL DEFAULT NULL,

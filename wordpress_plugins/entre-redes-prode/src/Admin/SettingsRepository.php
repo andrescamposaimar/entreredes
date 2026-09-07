@@ -168,11 +168,30 @@ class SettingsRepository {
      * Upserts a prode_settings row: UPDATE if row exists, INSERT if absent
      * (EDGE-06: migration may have left a row missing).
      *
-     * Returns true on success, false on DB error.
+     * No-op when the stored value already equals $value (updated_at drift
+     * fix): SettingsPage::handleSaveSettings() re-upserts every editable key
+     * on every Save click regardless of what the operator actually touched,
+     * so an unconditional restamp destroyed updated_at's meaning — it no
+     * longer told the operator WHEN a setting last changed, only when Save
+     * was last clicked. That actively misled a production investigation.
+     *
+     * Returns true on success (including the no-op case), false on DB error.
      */
     public function upsertSetting( string $key, string $value, int $actorWpId ): bool {
-        $now    = current_time( 'mysql' );
-        $p      = $this->wpdb->prefix;
+        $p = $this->wpdb->prefix;
+
+        $currentValue = $this->wpdb->get_var(
+            $this->wpdb->prepare(
+                "SELECT setting_value FROM {$p}prode_settings WHERE setting_key = %s",
+                $key
+            )
+        );
+
+        if ( null !== $currentValue && (string) $currentValue === $value ) {
+            return true; // Unchanged — updated_at/updated_by must not move.
+        }
+
+        $now = current_time( 'mysql' );
 
         // Try UPDATE first.
         $updated = $this->wpdb->update(
