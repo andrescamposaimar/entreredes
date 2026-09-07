@@ -1233,6 +1233,115 @@ void main() {
         expect(loaded.selectedFechaId, isNot(equals(3)));
       });
     });
+
+    // -------------------------------------------------------------------------
+    // Submit safety fixes
+    // -------------------------------------------------------------------------
+    group('Submit safety fixes', () {
+      // FIX 2: _setDraftStatusAndMarkSaved used to re-read
+      // current.drafts[matchId] when the awaited POST resolved, instead of
+      // using the score that was actually submitted. A same-fecha refresh()
+      // interleaved in between replaces the whole drafts map with a
+      // pre-submit server snapshot (the server hasn't processed the POST
+      // yet) — the completion handler must not mark THAT stale value as
+      // "submitted".
+      test(
+          'FIX 2: concurrent same-fecha refresh cannot mark a stale value as saved',
+          () async {
+        final submitCompleter = Completer<http.Response>();
+
+        _setUpFakeStorage({});
+        final repo = ProdeAuthRepository();
+        await repo.write(
+          accessToken: 'test-access',
+          refreshToken: 'test-refresh',
+          sessionVersion: '1',
+          tenantId: 'marianista',
+        );
+
+        final client = MockClient((request) async {
+          final path = request.url.path;
+
+          if (path.contains('/fechas') &&
+              !path.contains('/fecha/') &&
+              !path.contains('fecha-activa')) {
+            return http.Response(
+              json.encode({'fechas': [_g6eSummaryEntry(fechaId: 1)]}),
+              200,
+              headers: {'content-type': 'application/json'},
+            );
+          }
+
+          if (path.contains('fecha-activa')) {
+            // Initial load: no prediction yet.
+            return http.Response(
+              json.encode(_g6eFechaBody(fechaId: 1, matchCount: 1)),
+              200,
+              headers: {'content-type': 'application/json'},
+            );
+          }
+
+          final fechaByIdMatch = RegExp(r'/fecha/(\d+)$').firstMatch(path);
+          if (fechaByIdMatch != null) {
+            // refresh() re-fetches /fecha/1 — from the server's point of
+            // view the submit hasn't landed yet, so it still reports no
+            // user_predictions for this match.
+            return http.Response(
+              json.encode(_g6eFechaBody(fechaId: 1, matchCount: 1)),
+              200,
+              headers: {'content-type': 'application/json'},
+            );
+          }
+
+          if (path.contains('prediccion')) {
+            return submitCompleter.future;
+          }
+
+          return http.Response('{}', 404);
+        });
+
+        final service = _makeService(client, repo);
+        final controller = ProdeFixturesController(service);
+
+        await controller.load();
+
+        // User enters a prediction and starts submitting it.
+        controller.updateDraft(1, scoreHome: 2, scoreAway: 1);
+        final submitFuture = controller.submitPrediction(1);
+
+        // Before the POST resolves, a pull-to-refresh re-fetches the SAME
+        // fecha. The server hasn't processed the submit yet, so the refresh
+        // reseeds drafts with the stale pre-submit snapshot (no scores).
+        await controller.refresh();
+
+        final afterRefresh = controller.state as ProdeFixturesLoaded;
+        expect(
+          afterRefresh.drafts[1]?.scoreHome,
+          isNull,
+          reason:
+              'sanity check: refresh really did stomp the optimistic draft',
+        );
+
+        // Now the submit resolves successfully.
+        submitCompleter.complete(http.Response(
+          '{"status":"ok"}',
+          200,
+          headers: {'content-type': 'application/json'},
+        ));
+        await submitFuture;
+
+        final finalLoaded = controller.state as ProdeFixturesLoaded;
+        expect(
+          finalLoaded.drafts[1]?.scoreHome,
+          equals(2),
+          reason: 'The confirmed submitted score must win over a stale '
+              'refresh snapshot fetched before the POST landed.',
+        );
+        expect(finalLoaded.drafts[1]?.scoreAway, equals(1));
+        expect(finalLoaded.drafts[1]?.status, equals(SubmitStatus.submitted));
+        expect(finalLoaded.savedMatchIds, contains(1));
+      });
+    });
   });
 }
 

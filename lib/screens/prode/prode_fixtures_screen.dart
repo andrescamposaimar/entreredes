@@ -1043,6 +1043,26 @@ class _MatchCard extends StatelessWidget {
                             ],
                           ),
                         )
+                      else if (draft.status == SubmitStatus.error)
+                        // A previous submit attempt for this match failed and
+                        // was never retried successfully. The score shown
+                        // alongside this icon is still the last
+                        // server-confirmed value (or none) — never the failed
+                        // attempt — but the icon itself must make the failure
+                        // impossible to miss.
+                        //
+                        // This is checked BEFORE isSaved on purpose. The common
+                        // case is editing a prediction that is already saved:
+                        // isSaved stays true, so ordering it first would show a
+                        // green checkmark over a failed edit and tell the user
+                        // the exact opposite of what happened. An error always
+                        // wins the badge.
+                        Icon(
+                          key: Key('status_icon_error_${match.matchId}'),
+                          Icons.error_outline,
+                          color: Colors.red.shade400,
+                          size: 20,
+                        )
                       else if (isSaved)
                         Icon(
                           key: Key('status_icon_saved_${match.matchId}'),
@@ -1322,7 +1342,12 @@ class _StaleBanner extends StatelessWidget {
 /// Modal bottom sheet for entering or editing a match prediction.
 ///
 /// Opened via [showModalBottomSheet]. Holds local score state initialized
-/// from the existing [initialDraft] (or 0/0 when no prior prediction).
+/// from the existing [initialDraft] — null/null when there is no prior
+/// prediction, so the steppers start UNTOUCHED (displayed as "—", not "0").
+///
+/// A 0-0 scoreline is a real, valid prediction, so it must stay reachable
+/// with a single tap — but it must be a deliberate choice, not the value a
+/// reflex tap on GUARDAR happens to submit. See [_canSubmit].
 ///
 /// When [isLocked] is true, steppers and the GUARDAR button are disabled.
 class _PredictionSheet extends StatefulWidget {
@@ -1343,43 +1368,61 @@ class _PredictionSheet extends StatefulWidget {
 }
 
 class _PredictionSheetState extends State<_PredictionSheet> {
-  late int _homeScore;
-  late int _awayScore;
+  // Null means "not chosen yet" — distinct from a deliberate 0. The stepper
+  // shows "—" while null; the first tap (either + or -) gives it a concrete
+  // value and the sheet becomes submittable.
+  int? _homeScore;
+  int? _awayScore;
   bool _submitting = false;
   String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
-    _homeScore = widget.initialDraft.scoreHome ?? 0;
-    _awayScore = widget.initialDraft.scoreAway ?? 0;
+    _homeScore = widget.initialDraft.scoreHome;
+    _awayScore = widget.initialDraft.scoreAway;
   }
 
   int _clamp(int value) => value.clamp(0, 255);
 
-  void _incrementHome() => setState(() => _homeScore = _clamp(_homeScore + 1));
-  void _decrementHome() => setState(() => _homeScore = _clamp(_homeScore - 1));
-  void _incrementAway() => setState(() => _awayScore = _clamp(_awayScore + 1));
-  void _decrementAway() => setState(() => _awayScore = _clamp(_awayScore - 1));
+  // First tap of "+" on an untouched stepper starts counting from 1 (one
+  // goal scored); first tap of "-" starts from 0 (an explicit "no goals"),
+  // so picking 0-0 on purpose still only takes one tap per side.
+  void _incrementHome() =>
+      setState(() => _homeScore = _clamp((_homeScore ?? 0) + 1));
+  void _decrementHome() =>
+      setState(() => _homeScore = _clamp((_homeScore ?? 1) - 1));
+  void _incrementAway() =>
+      setState(() => _awayScore = _clamp((_awayScore ?? 0) + 1));
+  void _decrementAway() =>
+      setState(() => _awayScore = _clamp((_awayScore ?? 1) - 1));
 
   Future<void> _onGuardar() async {
-    if (widget.isLocked || _submitting) return;
+    final homeScore = _homeScore;
+    final awayScore = _awayScore;
+    if (widget.isLocked || _submitting || homeScore == null || awayScore == null) {
+      return;
+    }
 
     setState(() {
       _submitting = true;
       _errorMessage = null;
     });
 
-    widget.controller.updateDraft(
-      widget.match.matchId,
-      scoreHome: _homeScore,
-      scoreAway: _awayScore,
-    );
-
+    // Send the POST first. The shared draft (and the match card behind this
+    // sheet, which renders straight from it) is only updated by the
+    // controller once the server has actually confirmed the score — see
+    // ProdeFixturesController.submitPrediction. That way the card can never
+    // show a value the server didn't accept, and there is nothing to roll
+    // back on failure.
+    //
     // submitPrediction returns true on success, false on error/no-op.
     // This avoids reading the protected StateNotifier.state from outside the notifier.
-    final success =
-        await widget.controller.submitPrediction(widget.match.matchId);
+    final success = await widget.controller.submitPrediction(
+      widget.match.matchId,
+      scoreHome: homeScore,
+      scoreAway: awayScore,
+    );
 
     if (!mounted) return;
 
@@ -1399,6 +1442,7 @@ class _PredictionSheetState extends State<_PredictionSheet> {
     final primary = theme.colorScheme.primary;
     final matchId = widget.match.matchId;
     final canInteract = !widget.isLocked && !_submitting;
+    final canSubmit = canInteract && _homeScore != null && _awayScore != null;
 
     return Padding(
       padding: EdgeInsets.only(
@@ -1521,7 +1565,7 @@ class _PredictionSheetState extends State<_PredictionSheet> {
                     borderRadius: BorderRadius.circular(10),
                   ),
                 ),
-                onPressed: canInteract ? _onGuardar : null,
+                onPressed: canSubmit ? _onGuardar : null,
                 child: _submitting
                     ? const SizedBox(
                         width: 20,
@@ -1742,7 +1786,10 @@ class _PopularesChip extends StatelessWidget {
 class _ScoreStepper extends StatelessWidget {
   final int matchId;
   final String side; // 'home' or 'away'
-  final int value;
+
+  /// The chosen score, or null when the user hasn't picked one yet (shown
+  /// as "—", distinct from an explicit 0).
+  final int? value;
   final bool enabled;
   final VoidCallback? onIncrement;
   final VoidCallback? onDecrement;
@@ -1786,7 +1833,7 @@ class _ScoreStepper extends StatelessWidget {
           child: Center(
             child: Text(
               key: Key('stepper_${side}_value_$matchId'),
-              value.toString(),
+              value?.toString() ?? '—',
               style: TextStyle(
                 fontWeight: FontWeight.bold,
                 fontSize: 18,

@@ -81,7 +81,7 @@ class _StubControllerWithCallback extends ProdeFixturesController {
 /// Stub controller that records draft updates and submit calls for assertion.
 class _StubControllerWithDraftTracking extends ProdeFixturesController {
   final List<(int, int?, int?)> draftUpdates = [];
-  final List<int> submitCalls = [];
+  final List<(int, int?, int?)> submitCalls = [];
 
   // When set to true, submitPrediction succeeds and marks the match saved.
   bool submitSucceeds = false;
@@ -108,20 +108,24 @@ class _StubControllerWithDraftTracking extends ProdeFixturesController {
   }
 
   @override
-  Future<bool> submitPrediction(int matchId) async {
-    submitCalls.add(matchId);
+  Future<bool> submitPrediction(
+    int matchId, {
+    int? scoreHome,
+    int? scoreAway,
+  }) async {
+    submitCalls.add((matchId, scoreHome, scoreAway));
     if (submitSucceeds) {
-      // Simulate success: mark as saved
+      // Simulate success: mark as saved with the score that was actually
+      // submitted — mirrors the real controller's confirmed-value write.
       final current = state as ProdeFixturesLoaded;
-      final existing = current.drafts[matchId] ?? const PredictionDraft();
       final newDrafts = Map<int, PredictionDraft>.from(current.drafts)
-        ..[matchId] = existing.copyWith(status: SubmitStatus.submitted);
+        ..[matchId] = PredictionDraft(
+          scoreHome: scoreHome,
+          scoreAway: scoreAway,
+          status: SubmitStatus.submitted,
+        );
       final newSaved = {...current.savedMatchIds, matchId};
-      state = ProdeFixturesLoaded(
-        current.fecha,
-        drafts: newDrafts,
-        savedMatchIds: newSaved,
-      );
+      state = current.copyWith(drafts: newDrafts, savedMatchIds: newSaved);
       return true;
     }
     return false;
@@ -564,10 +568,10 @@ void main() {
         await tester.tap(find.byKey(const Key('match_card_1')));
         await tester.pumpAndSettle();
 
-        // Initial value is 0
+        // No score chosen yet — shown as "—", not "0" (FIX 3).
         final valueFinder = find.byKey(const Key('stepper_home_value_1'));
         expect(valueFinder, findsOneWidget);
-        expect(tester.widget<Text>(valueFinder).data, equals('0'));
+        expect(tester.widget<Text>(valueFinder).data, equals('—'));
 
         // Tap +
         await tester.tap(find.byKey(const Key('stepper_home_plus_1')));
@@ -583,7 +587,7 @@ void main() {
         await tester.tap(find.byKey(const Key('match_card_1')));
         await tester.pumpAndSettle();
 
-        // Already at 0, tap minus — should stay at 0
+        // Untouched (shown as "—"); tapping minus picks an explicit 0.
         await tester.tap(find.byKey(const Key('stepper_home_minus_1')));
         await tester.pump();
 
@@ -627,7 +631,9 @@ void main() {
         expect(find.byKey(const Key('guardar_1')), findsOneWidget);
       });
 
-      testWidgets('GUARDAR calls updateDraft and submitPrediction then closes', (tester) async {
+      testWidgets(
+          'GUARDAR calls submitPrediction with the chosen score, then closes',
+          (tester) async {
         final fecha = _makeFecha();
         final drafts = _seedDrafts(fecha);
         final stub = _StubControllerWithDraftTracking(
@@ -653,8 +659,11 @@ void main() {
         await tester.tap(find.byKey(const Key('match_card_1')));
         await tester.pumpAndSettle();
 
-        // Adjust score
+        // Pick a score (both sides — GUARDAR stays disabled until both are
+        // chosen, see FIX 3 test group below).
         await tester.tap(find.byKey(const Key('stepper_home_plus_1')));
+        await tester.pump();
+        await tester.tap(find.byKey(const Key('stepper_away_plus_1')));
         await tester.pump();
 
         // Tap GUARDAR
@@ -663,10 +672,135 @@ void main() {
 
         // Modal should be closed (stepper no longer visible)
         expect(find.byKey(const Key('stepper_home_plus_1')), findsNothing);
-        // Submit was called
-        expect(stub.submitCalls, contains(1));
-        // updateDraft was called
-        expect(stub.draftUpdates, isNotEmpty);
+        // Submit was called with the score chosen in the sheet.
+        expect(stub.submitCalls, contains((1, 1, 1)));
+        // FIX 1: the sheet no longer optimistically writes the shared draft
+        // via updateDraft before submitting — the POST goes out first.
+        expect(stub.draftUpdates, isEmpty);
+      });
+    });
+
+    // -------------------------------------------------------------------------
+    // Submit safety fixes: phantom optimistic score, stale-refresh race, and
+    // an untouched sheet being submittable.
+    // -------------------------------------------------------------------------
+
+    group('Submit safety fixes', () {
+      // FIX 3: no prediction should be submittable until the user has
+      // actually chosen a score. A fresh match (no prior prediction) opens
+      // the sheet with no score picked yet — GUARDAR must stay disabled
+      // until at least one stepper tap gives it a concrete value.
+      testWidgets(
+          'FIX 3: GUARDAR is disabled on a fresh, untouched sheet (0-0 must not '
+          'be submittable by reflex)', (tester) async {
+        final fecha = _makeFecha(); // matchId 1 has no prior prediction
+        await _pumpScreen(tester, ProdeFixturesLoaded(fecha));
+
+        await tester.tap(find.byKey(const Key('match_card_1')));
+        await tester.pumpAndSettle();
+
+        final button = tester.widget<ElevatedButton>(
+          find.byKey(const Key('guardar_1')),
+        );
+        expect(
+          button.onPressed,
+          isNull,
+          reason: 'An untouched sheet must not be submittable — 0-0 is a '
+              'real prediction, not "no answer yet".',
+        );
+      });
+
+      // FIX 1: a failed submit must not leave the optimistic score painted
+      // on the match card. The stub's submitPrediction fails by default
+      // (submitSucceeds is false), simulating a network/423/500 failure.
+      testWidgets(
+          'FIX 1: a failed submit does not leave a phantom score on the card',
+          (tester) async {
+        final fecha = _makeFecha(); // matchId 1 has no prior prediction
+        final stub = _StubControllerWithDraftTracking(
+          ProdeFixturesLoaded(fecha),
+        );
+        stub.submitSucceeds = false;
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              prodeFixturesControllerProvider.overrideWith((ref) => stub),
+            ],
+            child: const MaterialApp(
+              home: Scaffold(
+                body: ProdeFixturesScreen(onLogout: _noOp),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        // Open modal, pick a score (1-1).
+        await tester.tap(find.byKey(const Key('match_card_1')));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('stepper_home_plus_1')));
+        await tester.pump();
+        await tester.tap(find.byKey(const Key('stepper_away_plus_1')));
+        await tester.pump();
+
+        // Tap GUARDAR — the stub's submit fails.
+        await tester.tap(find.byKey(const Key('guardar_1')));
+        await tester.pumpAndSettle();
+
+        // The card behind the (still-open, on failure) sheet must never
+        // have shown the unconfirmed "1" — the server never accepted it.
+        expect(
+          find.descendant(
+            of: find.byKey(const Key('match_card_1')),
+            matching: find.text('1'),
+          ),
+          findsNothing,
+          reason: 'A failed submit must not leave a phantom score on the '
+              'card — the display must never run ahead of what the server '
+              'confirmed.',
+        );
+      });
+
+      // The badge chain checks the error state BEFORE isSaved. Editing an
+      // already-saved prediction is the common case — it is what the parents
+      // in the 2026-09-05 report were doing — and isSaved stays true through a
+      // failed edit. Ordering isSaved first would paint a green checkmark over
+      // a save that did not happen, telling the user the exact opposite of
+      // what occurred.
+      testWidgets(
+          'a failed edit of an already-saved prediction shows the error badge, '
+          'not the saved checkmark', (tester) async {
+        const matchId = 1;
+        final fecha = _makeFecha();
+
+        await _pumpScreen(
+          tester,
+          ProdeFixturesLoaded(
+            fecha,
+            drafts: const {
+              matchId: PredictionDraft(
+                scoreHome: 2,
+                scoreAway: 0,
+                status: SubmitStatus.error,
+              ),
+            },
+            savedMatchIds: const {matchId},
+          ),
+        );
+        await tester.pump();
+
+        expect(
+          find.byKey(const Key('status_icon_error_$matchId')),
+          findsOneWidget,
+          reason: 'An error must win the badge over isSaved — otherwise a '
+              'failed edit is indistinguishable from a successful one.',
+        );
+        expect(
+          find.byKey(const Key('status_icon_saved_$matchId')),
+          findsNothing,
+          reason: 'The saved checkmark must not survive a failed resubmit.',
+        );
       });
     });
 
@@ -1111,6 +1245,14 @@ void main() {
 
         await tester.tap(find.byKey(const Key('match_card_1')));
         await tester.pumpAndSettle();
+
+        // Pick a score first — an untouched sheet is disabled regardless of
+        // lock state (FIX 3). This test isolates the lock-state gate: once a
+        // score is chosen, an OPEN fecha must allow submitting it.
+        await tester.tap(find.byKey(const Key('stepper_home_plus_1')));
+        await tester.pump();
+        await tester.tap(find.byKey(const Key('stepper_away_plus_1')));
+        await tester.pump();
 
         final guardarFinder = find.byKey(const Key('guardar_1'));
         expect(guardarFinder, findsOneWidget);
