@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - release/bump-build-25
+
+# A new push to the same branch makes the previous run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-and-test:
+    name: Analyze and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the version used locally, not `stable`. A floating channel
+      # turns an unrelated PR red the day Flutter ships a new lint, which is
+      # how a build gate stops being trusted. Bump this deliberately.
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.41.9
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # Exits non-zero on any finding, info-level lints included, so the
+      # flutter_lints suite is genuinely enforced here.
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
