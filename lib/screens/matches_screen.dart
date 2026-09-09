@@ -9,6 +9,9 @@ import 'dart:async';
 import '../config/tenant_provider.dart';
 import '../providers/service_providers.dart';
 import '../providers/partidos_cache_provider.dart';
+import '../utils/date_utils.dart';
+import '../utils/text_utils.dart';
+import '../widgets/match_card.dart';
 import '../utils/liga_utils.dart';
 
 class MatchesScreen extends ConsumerStatefulWidget {
@@ -263,151 +266,76 @@ class _MatchesScreenState extends ConsumerState<MatchesScreen> with TickerProvid
   }
 
 
-  Widget _buildMatchCard(dynamic partido) {
-    final liga = _decodeHtmlEntities(partido['liga']?.toString());
-    final local = _decodeHtmlEntities(partido['equipo_local']?.toString());
-    final visitante = _decodeHtmlEntities(partido['equipo_visitante']?.toString());
-    final escudoLocal = partido['escudo_local']?.toString();
-    final escudoVisitante = partido['escudo_visitante']?.toString();
-    final fecha = partido['fecha'] ?? '-';
-    final hora = partido['hora'] ?? '-';
-    final cancha = _decodeHtmlEntities(partido['cancha']?.toString() ?? '-');
-    final mesa = (selectedTab != 0) ? (partido['mesa']?.toString() ?? '') : '';
-
-    return Card(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      elevation: 2,
-      margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 12),
-      child: Padding(
-        padding: const EdgeInsets.all(8),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(liga, style: const TextStyle(fontWeight: FontWeight.w500, fontSize: 15)),
-            const Divider(height: 16, thickness: 1, color: Color(0xFFE0E0E0)),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  flex: 3,
-                  child: Column(
-                    children: [
-                      _teamRow(local, escudoLocal, selectedTab == 0 ? _parseGoles(partido['goles_local']) : ''),
-                      const SizedBox(height: 6),
-                      _teamRow(visitante, escudoVisitante, selectedTab == 0 ? _parseGoles(partido['goles_visitante']) : ''),
-                    ],
-                  ),
-                ),
-                if (selectedTab == 1 || selectedTab == 2)
-                  Expanded(
-                    flex: 2,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.calendar_today, size: 16, color: Colors.green),
-                            const SizedBox(width: 4),
-                            Text(_formatearFecha(fecha), style: const TextStyle(fontSize: 12)),
-                          ],
-                        ),
-                        const SizedBox(height: 3),
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.access_time, size: 16, color: Colors.green),
-                            const SizedBox(width: 4),
-                            Text(hora, style: const TextStyle(fontSize: 12)),
-                          ],
-                        ),
-                        const SizedBox(height: 3),
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.location_on, size: 16, color: Colors.green),
-                            const SizedBox(width: 4),
-                            Flexible(
-                              child: Text(
-                                cancha.isNotEmpty ? cancha : '-',
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(fontSize: 12),
-                              ),
-                            ),
-                          ],
-                        ),
-                        if (mesa.isNotEmpty) ...[
-                          const SizedBox(height: 3),
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(Icons.groups, size: 16, color: Colors.green),
-                              const SizedBox(width: 4),
-                              Flexible(
-                                child: Text(
-                                  'Mesa: $mesa',
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(fontSize: 12),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                if (selectedTab == 0)
-                  TextButton(
-                    onPressed: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => MatchDetailScreen(partido: partido),
-                        ),
-                      );
-                    },
-                    child: const Text('Ver detalle'),
-                  ),
-              ],
-            ),
-          ],
-        ),
+  void _abrirDetalle(dynamic partido) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MatchDetailScreen(partido: partido),
       ),
     );
   }
 
-  Widget _teamRow(String nombre, String? escudoUrl, String goles) {
-    return Row(
-      children: [
-        if (escudoUrl != null && escudoUrl.isNotEmpty && Uri.tryParse(escudoUrl)?.hasScheme == true)
-          Image.network(
-            escudoUrl,
-            width: 24,
-            height: 24,
-            errorBuilder: (context, error, stackTrace) => const Icon(Icons.shield, size: 20, color: Colors.grey),
-          )
-        else
-          const Icon(Icons.shield, size: 20, color: Colors.grey),
-        const SizedBox(width: 8),
-        Expanded(child: Text(nombre, style: const TextStyle(fontSize: 16))),
-        Text(goles, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-      ],
+  Widget _buildMatchCard(dynamic partido) {
+    final esJugado = selectedTab == 0;
+    return MatchCard(
+      partido: Map<String, dynamic>.from(partido as Map),
+      mostrarResultado: esJugado,
+      // Only "Jugados" opens the detail.
+      onTap: esJugado ? () => _abrirDetalle(partido) : null,
+    );
+  }
+
+  /// Separator between date groups.
+  ///
+  /// A plain bold line used to dissolve into the list while scrolling, so the
+  /// header spans the full width over a neutral band — distinct from the
+  /// tinted strip the cards carry — and states how many matches follow.
+  Widget _buildFechaHeader(String fechaRaw, int cantidad) {
+    final primary = Theme.of(context).colorScheme.primary;
+    final titulo = formatFechaLarga(fechaRaw) ?? _formatearFechaLarga(fechaRaw);
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(top: 16, bottom: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.grey.shade100,
+        border: Border(
+          top: BorderSide(color: Colors.grey.shade200),
+          bottom: BorderSide(color: Colors.grey.shade200),
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.calendar_month, size: 16, color: primary.withValues(alpha: 0.8)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              titulo,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+                color: Colors.black87,
+              ),
+            ),
+          ),
+          Text(
+            cantidad == 1 ? '1 partido' : '$cantidad partidos',
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+          ),
+        ],
+      ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: EntreRedesAppBar(
+      appBar: const EntreRedesAppBar(
         title: 'Partidos',
         centerTitle: true,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            tooltip: 'Actualizar caché de partidos',
-            onPressed: _mostrarDialogYActualizarCache,
-          ),
-        ],
       ),
       body: Column(
         children: [
@@ -497,36 +425,6 @@ class _MatchesScreenState extends ConsumerState<MatchesScreen> with TickerProvid
       ),
     );
   }
-  String _formatearFecha(String fechaOriginal) {
-    try {
-      final partes = fechaOriginal.split('-');
-      if (partes.length == 3) {
-        final yyyy = partes[0];
-        final mm = partes[1];
-        final dd = partes[2];
-        final yy = yyyy.substring(2);
-        return '$dd-$mm-$yy';
-      }
-    } catch (_) {}
-    return fechaOriginal;
-  }
-
-  String _decodeHtmlEntities(String? text) {
-    if (text == null || text.isEmpty) return '-';
-    return text
-        .replaceAll('&amp;', '&')
-        .replaceAll('&#8211;', '-')
-        .replaceAll('&quot;', '"')
-        .replaceAll('&#8217;', "'")
-        .replaceAll('&#038;', '&')
-        .replaceAll('&#8216;', "'");
-  }
-
-  String _parseGoles(dynamic valor) {
-    if (valor == null || valor.toString().trim().isEmpty) return '-';
-    return valor.toString();
-  }
-
 Widget _buildEmptyJugados() {
   return Center(
     child: Column(
@@ -565,10 +463,7 @@ Widget _buildListaPorFecha() {
       });
 
     return [
-      Padding(
-        padding: const EdgeInsets.fromLTRB(12, 16, 12, 4),
-        child: Text(fecha, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-      ),
+      _buildFechaHeader(fecha, partidos.length),
       ...partidos.map((p) => _buildMatchCard(p)).toList(),
     ];
   }).toList();
@@ -871,30 +766,6 @@ Widget _buildListaPorFecha() {
     return null;
   }
 
-  Future<void> _mostrarDialogYActualizarCache() async {
-    showDialog(
-      context: context,
-      barrierDismissible: false, // 🔒 impide tocar fuera del modal
-      builder: (BuildContext context) {
-        return AlertDialog(
-          content: Row(
-            children: const [
-              CircularProgressIndicator(),
-              SizedBox(width: 20),
-              Expanded(child: Text('Actualizando cache de partidos...')),
-            ],
-          ),
-        );
-      },
-    );
-
-    await _forzarActualizacionCacheJugados(); // Llama a la función original
-
-    if (mounted) {
-      Navigator.of(context).pop(); // Cierra el modal
-    }
-  }
-
   // ─── FIXTURE ──────────────────────────────────────────────────────────────
 
   Future<void> _loadFixture() async {
@@ -920,12 +791,14 @@ Widget _buildListaPorFecha() {
 
       final Map<String, String?> escudos = {};
       for (final p in todos) {
-        final local = _decodeHtmlEntities(p['equipo_local']?.toString());
-        final visitante = _decodeHtmlEntities(p['equipo_visitante']?.toString());
+        // These names are map keys, not display text: they must be decoded the
+        // same way here and wherever they are looked up.
+        final local = decodeHtmlEntities(p['equipo_local']?.toString());
+        final visitante = decodeHtmlEntities(p['equipo_visitante']?.toString());
         final eLocal = p['escudo_local']?.toString();
         final eVisitante = p['escudo_visitante']?.toString();
-        if (local != '-') escudos.putIfAbsent(local, () => (eLocal?.isNotEmpty == true) ? eLocal : null);
-        if (visitante != '-') escudos.putIfAbsent(visitante, () => (eVisitante?.isNotEmpty == true) ? eVisitante : null);
+        if (local.isNotEmpty) escudos.putIfAbsent(local, () => (eLocal?.isNotEmpty == true) ? eLocal : null);
+        if (visitante.isNotEmpty) escudos.putIfAbsent(visitante, () => (eVisitante?.isNotEmpty == true) ? eVisitante : null);
       }
 
       if (!mounted) return;
@@ -1106,8 +979,8 @@ Widget _buildListaPorFecha() {
     final filtrados = selectedFixtureEquipo == null
         ? todosLosPartidosProgramados
         : todosLosPartidosProgramados.where((p) {
-            final local = _decodeHtmlEntities(p['equipo_local']?.toString());
-            final visitante = _decodeHtmlEntities(p['equipo_visitante']?.toString());
+            final local = decodeHtmlEntities(p['equipo_local']?.toString());
+            final visitante = decodeHtmlEntities(p['equipo_visitante']?.toString());
             return local == selectedFixtureEquipo || visitante == selectedFixtureEquipo;
           }).toList();
 
@@ -1198,13 +1071,7 @@ Widget _buildListaPorFecha() {
 
     final children = fechasOrdenadas.expand((fecha) {
       return <Widget>[
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 16, 12, 4),
-          child: Text(
-            _formatearFechaLarga(fecha),
-            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-        ),
+        _buildFechaHeader(fecha, grupos[fecha]!.length),
         ...grupos[fecha]!.map((p) => _buildMatchCard(p)),
       ];
     }).toList();
@@ -1242,33 +1109,4 @@ Widget _buildListaPorFecha() {
     return fechaRaw;
   }
 
-  // ──────────────────────────────────────────────────────────────────────────
-
-  Future<void> _forzarActualizacionCacheJugados() async {
-    try {
-      final res = await ref.read(apiServiceProvider).getPartidos(page: 1, perPage: 16, temporada: widget.temporadaId);
-      final nuevos = res['items'] ?? [];
-
-      if (nuevos.isNotEmpty) {
-        await _guardarCache('jugados', nuevos);
-        if (mounted) {
-          setState(() {
-            partidosJugados = nuevos;
-            currentPageJugados = 2;
-            hasMoreJugados = nuevos.length >= 16;
-            selectedZonaNombre = null;
-          });
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Caché actualizada correctamente')),
-          );
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error al actualizar caché: $e')),
-        );
-      }
-    }
-  }
 }

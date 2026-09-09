@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace EntreRedes\Prode\Tests\Rest;
 
+use EntreRedes\Prode\Audit\AuditLogger;
 use EntreRedes\Prode\Auth\AuthMiddleware;
 use EntreRedes\Prode\Auth\JwtService;
 use EntreRedes\Prode\Auth\SessionManager;
@@ -33,6 +34,7 @@ class PredictionControllerTest extends TestCase {
     private AuthMiddleware       $middleware;
     private JwtService           $jwt;
     private SessionManager       $session;
+    private AuditLogger          $auditLogger;
 
     /** fecha_id seeded by seedActiveFecha() */
     private int $fechaId;
@@ -45,15 +47,17 @@ class PredictionControllerTest extends TestCase {
         $wpdb->query( "DELETE FROM {$wpdb->prefix}prode_fecha_matches" );
         $wpdb->query( "DELETE FROM {$wpdb->prefix}prode_fechas" );
         $wpdb->query( "DELETE FROM {$wpdb->prefix}prode_users" );
+        $wpdb->query( "DELETE FROM {$wpdb->prefix}prode_audit_log" );
 
         $this->provisionKeys();
         $this->seedTestUser();
 
-        $this->predRepo   = new PredictionRepository( $wpdb );
-        $this->fechaRepo  = new FechaRepository( $wpdb );
-        $this->jwt        = new JwtService();
-        $this->session    = new SessionManager();
-        $this->middleware = new AuthMiddleware( $this->jwt, $this->session );
+        $this->predRepo    = new PredictionRepository( $wpdb );
+        $this->fechaRepo   = new FechaRepository( $wpdb );
+        $this->jwt         = new JwtService();
+        $this->session     = new SessionManager();
+        $this->middleware  = new AuthMiddleware( $this->jwt, $this->session );
+        $this->auditLogger = new AuditLogger();
     }
 
     protected function tearDown(): void {
@@ -61,6 +65,7 @@ class PredictionControllerTest extends TestCase {
         $wpdb->query( "DELETE FROM {$wpdb->prefix}prode_predictions" );
         $wpdb->query( "DELETE FROM {$wpdb->prefix}prode_fecha_matches" );
         $wpdb->query( "DELETE FROM {$wpdb->prefix}prode_fechas" );
+        $wpdb->query( "DELETE FROM {$wpdb->prefix}prode_audit_log" );
         InitialSchema::up();
     }
 
@@ -109,7 +114,30 @@ class PredictionControllerTest extends TestCase {
      */
     private function makeController(): PredictionController {
         global $wpdb;
-        return new PredictionController( $this->predRepo, $this->fechaRepo, $this->middleware );
+        return new PredictionController( $this->predRepo, $this->fechaRepo, $this->middleware, $this->auditLogger );
+    }
+
+    /**
+     * Fetch the single most recent prode_audit_log row (by id) for assertions.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function fetchLatestAuditRow(): ?array {
+        global $wpdb;
+        return $wpdb->get_row(
+            "SELECT * FROM {$wpdb->prefix}prode_audit_log ORDER BY id DESC LIMIT 1",
+            ARRAY_A
+        );
+    }
+
+    private function countAuditRows( string $eventType ): int {
+        global $wpdb;
+        return (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->prefix}prode_audit_log WHERE event_type = %s",
+                $eventType
+            )
+        );
     }
 
     /**
@@ -340,5 +368,144 @@ class PredictionControllerTest extends TestCase {
         $this->assertSame( '1', $row['result'] ); // 2 > 1 → home win
         $this->assertSame( $this->fechaId, (int) $row['fecha_id'] );
         $this->assertSame( '2099-12-31 23:59:00', $row['locked_at_snapshot'] );
+    }
+
+    // -------------------------------------------------------------------------
+    // Audit logging — accepted writes and every rejection are recorded
+    // -------------------------------------------------------------------------
+
+    public function test_valid_submit_logs_prediction_submitted_as_insert(): void {
+        $this->seedActiveFecha();
+        $controller = $this->makeController();
+        $request    = $this->makeAuthedRequest( [
+            'fecha_id'   => $this->fechaId,
+            'match_id'   => 10,
+            'score_home' => 2,
+            'score_away' => 1,
+        ] );
+
+        $controller->submitPrediction( $request );
+
+        $this->assertSame( 1, $this->countAuditRows( 'prediction_submitted' ) );
+
+        $row      = $this->fetchLatestAuditRow();
+        $metadata = json_decode( (string) $row['metadata_json'], true );
+
+        $this->assertSame( 'prediction_submitted', $row['event_type'] );
+        $this->assertSame( 1, $metadata['prode_user_id'] );
+        $this->assertSame( $this->fechaId, $metadata['fecha_id'] );
+        $this->assertSame( 10, $metadata['match_id'] );
+        $this->assertSame( 2, $metadata['score_home'] );
+        $this->assertSame( 1, $metadata['score_away'] );
+        $this->assertSame( 'insert', $metadata['operation'] );
+        $this->assertSame( 'self', $metadata['actor'] );
+
+        // Never a raw DNI in this event — DniHasher is not even invoked here.
+        $this->assertNull( $row['dni_hash'] );
+    }
+
+    public function test_resubmit_logs_prediction_submitted_as_update(): void {
+        $this->seedActiveFecha();
+        $controller = $this->makeController();
+
+        $controller->submitPrediction( $this->makeAuthedRequest( [
+            'fecha_id'   => $this->fechaId,
+            'match_id'   => 10,
+            'score_home' => 2,
+            'score_away' => 1,
+        ] ) );
+
+        $controller->submitPrediction( $this->makeAuthedRequest( [
+            'fecha_id'   => $this->fechaId,
+            'match_id'   => 10,
+            'score_home' => 0,
+            'score_away' => 0,
+        ] ) );
+
+        $this->assertSame( 2, $this->countAuditRows( 'prediction_submitted' ) );
+
+        $row      = $this->fetchLatestAuditRow();
+        $metadata = json_decode( (string) $row['metadata_json'], true );
+        $this->assertSame( 'update', $metadata['operation'] );
+        $this->assertSame( 0, $metadata['score_home'] );
+        $this->assertSame( 0, $metadata['score_away'] );
+    }
+
+    public function test_missing_field_logs_prediction_rejected_with_reason(): void {
+        $this->seedActiveFecha();
+        $controller = $this->makeController();
+        $request    = $this->makeAuthedRequest( [
+            'fecha_id'   => $this->fechaId,
+            'match_id'   => 10,
+            'score_home' => 1,
+            // score_away absent
+        ] );
+
+        $controller->submitPrediction( $request );
+
+        $this->assertSame( 1, $this->countAuditRows( 'prediction_rejected' ) );
+
+        $row      = $this->fetchLatestAuditRow();
+        $metadata = json_decode( (string) $row['metadata_json'], true );
+        $this->assertSame( 'prediction_rejected', $row['event_type'] );
+        $this->assertSame( 'missing_field', $metadata['reason'] );
+        $this->assertSame( 1, $metadata['prode_user_id'] );
+        $this->assertNull( $metadata['score_away'] );
+    }
+
+    public function test_invalid_score_logs_prediction_rejected_with_attempted_score(): void {
+        $this->seedActiveFecha();
+        $controller = $this->makeController();
+        $request    = $this->makeAuthedRequest( [
+            'fecha_id'   => $this->fechaId,
+            'match_id'   => 10,
+            'score_home' => 256,
+            'score_away' => 0,
+        ] );
+
+        $controller->submitPrediction( $request );
+
+        $row      = $this->fetchLatestAuditRow();
+        $metadata = json_decode( (string) $row['metadata_json'], true );
+        $this->assertSame( 'invalid_score', $metadata['reason'] );
+        $this->assertSame( 256, $metadata['score_home'] );
+    }
+
+    public function test_match_not_found_logs_prediction_rejected(): void {
+        $this->seedActiveFecha();
+        $controller = $this->makeController();
+        $request    = $this->makeAuthedRequest( [
+            'fecha_id'   => $this->fechaId,
+            'match_id'   => 999,
+            'score_home' => 1,
+            'score_away' => 0,
+        ] );
+
+        $controller->submitPrediction( $request );
+
+        $row      = $this->fetchLatestAuditRow();
+        $metadata = json_decode( (string) $row['metadata_json'], true );
+        $this->assertSame( 'match_not_found', $metadata['reason'] );
+        $this->assertSame( 999, $metadata['match_id'] );
+    }
+
+    public function test_locked_fecha_logs_prediction_rejected_with_reason_fecha_locked(): void {
+        $this->seedActiveFecha( '2000-01-01 00:00:00' );
+        $controller = $this->makeController();
+        $request    = $this->makeAuthedRequest( [
+            'fecha_id'   => $this->fechaId,
+            'match_id'   => 10,
+            'score_home' => 1,
+            'score_away' => 0,
+        ] );
+
+        $controller->submitPrediction( $request );
+
+        $row      = $this->fetchLatestAuditRow();
+        $metadata = json_decode( (string) $row['metadata_json'], true );
+        $this->assertSame( 'prediction_rejected', $row['event_type'] );
+        $this->assertSame( 'fecha_locked', $metadata['reason'] );
+        $this->assertSame( 10, $metadata['match_id'] );
+        $this->assertSame( 1, $metadata['score_home'] );
     }
 }

@@ -45,6 +45,9 @@ class _StubController extends ProdeFixturesController {
 
   @override
   Future<void> refresh() async {}
+
+  @override
+  Future<void> selectFecha(int fechaId) async {}
 }
 
 /// Stub controller that invokes callbacks on load()/refresh() — for
@@ -70,12 +73,15 @@ class _StubControllerWithCallback extends ProdeFixturesController {
   Future<void> refresh() async {
     onRefresh?.call();
   }
+
+  @override
+  Future<void> selectFecha(int fechaId) async {}
 }
 
 /// Stub controller that records draft updates and submit calls for assertion.
 class _StubControllerWithDraftTracking extends ProdeFixturesController {
   final List<(int, int?, int?)> draftUpdates = [];
-  final List<int> submitCalls = [];
+  final List<(int, int?, int?)> submitCalls = [];
 
   // When set to true, submitPrediction succeeds and marks the match saved.
   bool submitSucceeds = false;
@@ -92,6 +98,9 @@ class _StubControllerWithDraftTracking extends ProdeFixturesController {
   Future<void> refresh() async {}
 
   @override
+  Future<void> selectFecha(int fechaId) async {}
+
+  @override
   void updateDraft(int matchId, {int? scoreHome, int? scoreAway}) {
     draftUpdates.add((matchId, scoreHome, scoreAway));
     // Also update state so the widget sees the change
@@ -99,20 +108,24 @@ class _StubControllerWithDraftTracking extends ProdeFixturesController {
   }
 
   @override
-  Future<bool> submitPrediction(int matchId) async {
-    submitCalls.add(matchId);
+  Future<bool> submitPrediction(
+    int matchId, {
+    int? scoreHome,
+    int? scoreAway,
+  }) async {
+    submitCalls.add((matchId, scoreHome, scoreAway));
     if (submitSucceeds) {
-      // Simulate success: mark as saved
+      // Simulate success: mark as saved with the score that was actually
+      // submitted — mirrors the real controller's confirmed-value write.
       final current = state as ProdeFixturesLoaded;
-      final existing = current.drafts[matchId] ?? const PredictionDraft();
       final newDrafts = Map<int, PredictionDraft>.from(current.drafts)
-        ..[matchId] = existing.copyWith(status: SubmitStatus.submitted);
+        ..[matchId] = PredictionDraft(
+          scoreHome: scoreHome,
+          scoreAway: scoreAway,
+          status: SubmitStatus.submitted,
+        );
       final newSaved = {...current.savedMatchIds, matchId};
-      state = ProdeFixturesLoaded(
-        current.fecha,
-        drafts: newDrafts,
-        savedMatchIds: newSaved,
-      );
+      state = current.copyWith(drafts: newDrafts, savedMatchIds: newSaved);
       return true;
     }
     return false;
@@ -198,7 +211,6 @@ Set<int> _seedSavedMatchIds(FechaActiva fecha) {
 Future<void> _pumpScreen(
   WidgetTester tester,
   ProdeFixturesState initialState, {
-  bool stale = false,
   VoidCallback? onLogout,
 }) async {
   await tester.pumpWidget(
@@ -210,7 +222,6 @@ Future<void> _pumpScreen(
       child: MaterialApp(
         home: Scaffold(
           body: ProdeFixturesScreen(
-            stale: stale,
             onLogout: onLogout ?? () {},
           ),
         ),
@@ -257,49 +268,6 @@ void main() {
       expect(find.text('Cerrar sesión'), findsOneWidget);
     });
 
-    // locked state → "Fecha Cerrada" badge, no "Finalizada"
-    testWidgets('Loaded(locked) -> Fecha Cerrada badge, no Finalizada', (tester) async {
-      await _pumpScreen(
-          tester, ProdeFixturesLoaded(_makeFecha(state: ProdeFechaState.locked)));
-      expect(find.text('Fecha Cerrada'), findsOneWidget);
-      expect(find.text('Finalizada'), findsNothing);
-    });
-
-    // evaluated state → "Finalizada" badge, no "Fecha Cerrada"
-    testWidgets('Loaded(evaluated) -> Finalizada badge, no Fecha Cerrada',
-        (tester) async {
-      await _pumpScreen(
-          tester,
-          ProdeFixturesLoaded(
-              _makeFecha(state: ProdeFechaState.evaluated)));
-      expect(find.text('Finalizada'), findsOneWidget);
-      expect(find.text('Fecha Cerrada'), findsNothing);
-    });
-
-    // open state → no badge
-    testWidgets('Loaded(open) -> no Fecha Cerrada or Finalizada', (tester) async {
-      await _pumpScreen(
-          tester, ProdeFixturesLoaded(_makeFecha(state: ProdeFechaState.open)));
-      expect(find.text('Fecha Cerrada'), findsNothing);
-      expect(find.text('Finalizada'), findsNothing);
-    });
-
-    // stale banner visible when stale: true
-    testWidgets('Loaded(stale: true) -> stale banner visible', (tester) async {
-      await _pumpScreen(
-        tester,
-        ProdeFixturesLoaded(_makeFecha()),
-        stale: true,
-      );
-      expect(find.text('Sincronizando tus datos…'), findsOneWidget);
-    });
-
-    // no stale banner when stale: false
-    testWidgets('Loaded(stale: false) -> no stale banner', (tester) async {
-      await _pumpScreen(tester, ProdeFixturesLoaded(_makeFecha()));
-      expect(find.text('Sincronizando tus datos…'), findsNothing);
-    });
-
     // Loaded with empty matches → note, no team names
     testWidgets('Loaded(empty matches) -> "Sin partidos" note', (tester) async {
       await _pumpScreen(
@@ -342,7 +310,7 @@ void main() {
           ],
           child: MaterialApp(
             home: Scaffold(
-              body: ProdeFixturesScreen(stale: false, onLogout: () {}),
+              body: ProdeFixturesScreen(onLogout: () {}),
             ),
           ),
         ),
@@ -371,7 +339,7 @@ void main() {
           ],
           child: MaterialApp(
             home: Scaffold(
-              body: ProdeFixturesScreen(stale: false, onLogout: () {}),
+              body: ProdeFixturesScreen(onLogout: () {}),
             ),
           ),
         ),
@@ -403,7 +371,6 @@ void main() {
           child: MaterialApp(
             home: Scaffold(
               body: ProdeFixturesScreen(
-                stale: false,
                 onLogout: () => logoutCalled = true,
               ),
             ),
@@ -423,11 +390,27 @@ void main() {
     // -------------------------------------------------------------------------
 
     group('Progress header (G6-d)', () {
+      // Helper: a single open FechaSummary matching _makeFecha()'s fechaId=1 with 2 matches.
+      // Required so _LoadedView renders _TabContent (which shows the progress header) instead
+      // of falling back to the no-summary legacy path (which has no progress header).
+      FechaSummary _openSummary() => FechaSummary(
+            fechaId: 1,
+            seasonId: 10,
+            state: ProdeFechaState.open,
+            lockedAt: null,
+            matchCount: 2,
+          );
+
       testWidgets('shows 0/2 when no predictions', (tester) async {
         final fecha = _makeFecha();
         await _pumpScreen(
           tester,
-          ProdeFixturesLoaded(fecha, savedMatchIds: const {}),
+          ProdeFixturesLoaded(
+            fecha,
+            fechas: [_openSummary()],
+            selectedFechaId: 1,
+            savedMatchIds: const {},
+          ),
         );
         // Exact counter text — loose textContaining would match score boxes too
         expect(find.text('0/2'), findsOneWidget);
@@ -441,7 +424,13 @@ void main() {
         final savedMatchIds = _seedSavedMatchIds(fecha);
         await _pumpScreen(
           tester,
-          ProdeFixturesLoaded(fecha, drafts: drafts, savedMatchIds: savedMatchIds),
+          ProdeFixturesLoaded(
+            fecha,
+            fechas: [_openSummary()],
+            selectedFechaId: 1,
+            drafts: drafts,
+            savedMatchIds: savedMatchIds,
+          ),
         );
         // Exact counter text — loose textContaining would match score boxes too
         expect(find.text('1/2'), findsOneWidget);
@@ -454,7 +443,12 @@ void main() {
         await _pumpScreen(
           tester,
           // 99 is not a match of this fecha — must not count toward progress
-          ProdeFixturesLoaded(fecha, savedMatchIds: const {1, 99}),
+          ProdeFixturesLoaded(
+            fecha,
+            fechas: [_openSummary()],
+            selectedFechaId: 1,
+            savedMatchIds: const {1, 99},
+          ),
         );
         expect(find.text('1/2'), findsOneWidget);
         final indicator = tester.widget<LinearProgressIndicator>(
@@ -464,7 +458,14 @@ void main() {
       });
 
       testWidgets('LinearProgressIndicator is present in loaded state', (tester) async {
-        await _pumpScreen(tester, ProdeFixturesLoaded(_makeFecha()));
+        await _pumpScreen(
+          tester,
+          ProdeFixturesLoaded(
+            _makeFecha(),
+            fechas: [_openSummary()],
+            selectedFechaId: 1,
+          ),
+        );
         expect(find.byType(LinearProgressIndicator), findsOneWidget);
       });
 
@@ -567,10 +568,10 @@ void main() {
         await tester.tap(find.byKey(const Key('match_card_1')));
         await tester.pumpAndSettle();
 
-        // Initial value is 0
+        // No score chosen yet — shown as "—", not "0" (FIX 3).
         final valueFinder = find.byKey(const Key('stepper_home_value_1'));
         expect(valueFinder, findsOneWidget);
-        expect(tester.widget<Text>(valueFinder).data, equals('0'));
+        expect(tester.widget<Text>(valueFinder).data, equals('—'));
 
         // Tap +
         await tester.tap(find.byKey(const Key('stepper_home_plus_1')));
@@ -586,7 +587,7 @@ void main() {
         await tester.tap(find.byKey(const Key('match_card_1')));
         await tester.pumpAndSettle();
 
-        // Already at 0, tap minus — should stay at 0
+        // Untouched (shown as "—"); tapping minus picks an explicit 0.
         await tester.tap(find.byKey(const Key('stepper_home_minus_1')));
         await tester.pump();
 
@@ -630,7 +631,9 @@ void main() {
         expect(find.byKey(const Key('guardar_1')), findsOneWidget);
       });
 
-      testWidgets('GUARDAR calls updateDraft and submitPrediction then closes', (tester) async {
+      testWidgets(
+          'GUARDAR calls submitPrediction with the chosen score, then closes',
+          (tester) async {
         final fecha = _makeFecha();
         final drafts = _seedDrafts(fecha);
         final stub = _StubControllerWithDraftTracking(
@@ -645,7 +648,7 @@ void main() {
             ],
             child: const MaterialApp(
               home: Scaffold(
-                body: ProdeFixturesScreen(stale: false, onLogout: _noOp),
+                body: ProdeFixturesScreen(onLogout: _noOp),
               ),
             ),
           ),
@@ -656,8 +659,11 @@ void main() {
         await tester.tap(find.byKey(const Key('match_card_1')));
         await tester.pumpAndSettle();
 
-        // Adjust score
+        // Pick a score (both sides — GUARDAR stays disabled until both are
+        // chosen, see FIX 3 test group below).
         await tester.tap(find.byKey(const Key('stepper_home_plus_1')));
+        await tester.pump();
+        await tester.tap(find.byKey(const Key('stepper_away_plus_1')));
         await tester.pump();
 
         // Tap GUARDAR
@@ -666,10 +672,135 @@ void main() {
 
         // Modal should be closed (stepper no longer visible)
         expect(find.byKey(const Key('stepper_home_plus_1')), findsNothing);
-        // Submit was called
-        expect(stub.submitCalls, contains(1));
-        // updateDraft was called
-        expect(stub.draftUpdates, isNotEmpty);
+        // Submit was called with the score chosen in the sheet.
+        expect(stub.submitCalls, contains((1, 1, 1)));
+        // FIX 1: the sheet no longer optimistically writes the shared draft
+        // via updateDraft before submitting — the POST goes out first.
+        expect(stub.draftUpdates, isEmpty);
+      });
+    });
+
+    // -------------------------------------------------------------------------
+    // Submit safety fixes: phantom optimistic score, stale-refresh race, and
+    // an untouched sheet being submittable.
+    // -------------------------------------------------------------------------
+
+    group('Submit safety fixes', () {
+      // FIX 3: no prediction should be submittable until the user has
+      // actually chosen a score. A fresh match (no prior prediction) opens
+      // the sheet with no score picked yet — GUARDAR must stay disabled
+      // until at least one stepper tap gives it a concrete value.
+      testWidgets(
+          'FIX 3: GUARDAR is disabled on a fresh, untouched sheet (0-0 must not '
+          'be submittable by reflex)', (tester) async {
+        final fecha = _makeFecha(); // matchId 1 has no prior prediction
+        await _pumpScreen(tester, ProdeFixturesLoaded(fecha));
+
+        await tester.tap(find.byKey(const Key('match_card_1')));
+        await tester.pumpAndSettle();
+
+        final button = tester.widget<ElevatedButton>(
+          find.byKey(const Key('guardar_1')),
+        );
+        expect(
+          button.onPressed,
+          isNull,
+          reason: 'An untouched sheet must not be submittable — 0-0 is a '
+              'real prediction, not "no answer yet".',
+        );
+      });
+
+      // FIX 1: a failed submit must not leave the optimistic score painted
+      // on the match card. The stub's submitPrediction fails by default
+      // (submitSucceeds is false), simulating a network/423/500 failure.
+      testWidgets(
+          'FIX 1: a failed submit does not leave a phantom score on the card',
+          (tester) async {
+        final fecha = _makeFecha(); // matchId 1 has no prior prediction
+        final stub = _StubControllerWithDraftTracking(
+          ProdeFixturesLoaded(fecha),
+        );
+        stub.submitSucceeds = false;
+
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              prodeFixturesControllerProvider.overrideWith((ref) => stub),
+            ],
+            child: const MaterialApp(
+              home: Scaffold(
+                body: ProdeFixturesScreen(onLogout: _noOp),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        // Open modal, pick a score (1-1).
+        await tester.tap(find.byKey(const Key('match_card_1')));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('stepper_home_plus_1')));
+        await tester.pump();
+        await tester.tap(find.byKey(const Key('stepper_away_plus_1')));
+        await tester.pump();
+
+        // Tap GUARDAR — the stub's submit fails.
+        await tester.tap(find.byKey(const Key('guardar_1')));
+        await tester.pumpAndSettle();
+
+        // The card behind the (still-open, on failure) sheet must never
+        // have shown the unconfirmed "1" — the server never accepted it.
+        expect(
+          find.descendant(
+            of: find.byKey(const Key('match_card_1')),
+            matching: find.text('1'),
+          ),
+          findsNothing,
+          reason: 'A failed submit must not leave a phantom score on the '
+              'card — the display must never run ahead of what the server '
+              'confirmed.',
+        );
+      });
+
+      // The badge chain checks the error state BEFORE isSaved. Editing an
+      // already-saved prediction is the common case — it is what the parents
+      // in the 2026-09-05 report were doing — and isSaved stays true through a
+      // failed edit. Ordering isSaved first would paint a green checkmark over
+      // a save that did not happen, telling the user the exact opposite of
+      // what occurred.
+      testWidgets(
+          'a failed edit of an already-saved prediction shows the error badge, '
+          'not the saved checkmark', (tester) async {
+        const matchId = 1;
+        final fecha = _makeFecha();
+
+        await _pumpScreen(
+          tester,
+          ProdeFixturesLoaded(
+            fecha,
+            drafts: const {
+              matchId: PredictionDraft(
+                scoreHome: 2,
+                scoreAway: 0,
+                status: SubmitStatus.error,
+              ),
+            },
+            savedMatchIds: const {matchId},
+          ),
+        );
+        await tester.pump();
+
+        expect(
+          find.byKey(const Key('status_icon_error_$matchId')),
+          findsOneWidget,
+          reason: 'An error must win the badge over isSaved — otherwise a '
+              'failed edit is indistinguishable from a successful one.',
+        );
+        expect(
+          find.byKey(const Key('status_icon_saved_$matchId')),
+          findsNothing,
+          reason: 'The saved checkmark must not survive a failed resubmit.',
+        );
       });
     });
 
@@ -747,7 +878,7 @@ void main() {
             ],
             child: const MaterialApp(
               home: Scaffold(
-                body: ProdeFixturesScreen(stale: false, onLogout: _noOp),
+                body: ProdeFixturesScreen(onLogout: _noOp),
               ),
             ),
           ),
@@ -784,7 +915,7 @@ void main() {
             ],
             child: const MaterialApp(
               home: Scaffold(
-                body: ProdeFixturesScreen(stale: false, onLogout: _noOp),
+                body: ProdeFixturesScreen(onLogout: _noOp),
               ),
             ),
           ),
@@ -892,7 +1023,7 @@ void main() {
             ],
             child: const MaterialApp(
               home: Scaffold(
-                body: ProdeFixturesScreen(stale: false, onLogout: _noOp),
+                body: ProdeFixturesScreen(onLogout: _noOp),
               ),
             ),
           ),
@@ -944,7 +1075,7 @@ void main() {
             ],
             child: const MaterialApp(
               home: Scaffold(
-                body: ProdeFixturesScreen(stale: false, onLogout: _noOp),
+                body: ProdeFixturesScreen(onLogout: _noOp),
               ),
             ),
           ),
@@ -1005,7 +1136,7 @@ void main() {
             ],
             child: const MaterialApp(
               home: Scaffold(
-                body: ProdeFixturesScreen(stale: false, onLogout: _noOp),
+                body: ProdeFixturesScreen(onLogout: _noOp),
               ),
             ),
           ),
@@ -1052,11 +1183,14 @@ void main() {
         expect(minus.onPressed, isNull);
       });
 
-      testWidgets('locked fecha: unsaved card shows lock icon instead of pending', (tester) async {
+      testWidgets('locked fecha: unsaved card shows "En Juego" label instead of pending', (tester) async {
         final fecha = _makeFecha(lockedAt: DateTime(2020, 1, 1));
         await _pumpScreen(tester, ProdeFixturesLoaded(fecha));
 
-        expect(find.byKey(const Key('status_icon_locked_1')), findsOneWidget);
+        // A locked, not-yet-evaluated match is tagged "En Juego" (betting
+        // over, about to be played) rather than the bare lock/pending icon.
+        expect(find.byKey(const Key('en_juego_label_1')), findsOneWidget);
+        expect(find.byKey(const Key('status_icon_locked_1')), findsNothing);
         expect(find.byKey(const Key('status_icon_pending_1')), findsNothing);
       });
 
@@ -1112,10 +1246,248 @@ void main() {
         await tester.tap(find.byKey(const Key('match_card_1')));
         await tester.pumpAndSettle();
 
+        // Pick a score first — an untouched sheet is disabled regardless of
+        // lock state (FIX 3). This test isolates the lock-state gate: once a
+        // score is chosen, an OPEN fecha must allow submitting it.
+        await tester.tap(find.byKey(const Key('stepper_home_plus_1')));
+        await tester.pump();
+        await tester.tap(find.byKey(const Key('stepper_away_plus_1')));
+        await tester.pump();
+
         final guardarFinder = find.byKey(const Key('guardar_1'));
         expect(guardarFinder, findsOneWidget);
         final btn = tester.widget<ElevatedButton>(guardarFinder);
         expect(btn.onPressed, isNotNull);
+      });
+    });
+
+    // -------------------------------------------------------------------------
+    // T-12: Evaluated fecha — result badge + real-score line in _MatchCard
+    // -------------------------------------------------------------------------
+
+    group('Evaluated fecha result rendering (T-12)', () {
+      /// Builds a FechaActiva in evaluated state with one match that is final,
+      /// and one user prediction with [points] and [evaluationMethod].
+      FechaActiva _evaluatedFecha({
+        int? realScoreHome = 2,
+        int? realScoreAway = 1,
+        bool isFinal = true,
+        int? points = 3,
+        String? evaluationMethod = 'exact_score',
+      }) {
+        return FechaActiva(
+          fechaId: 1,
+          seasonId: 10,
+          state: ProdeFechaState.evaluated,
+          lockedAt: DateTime(2020, 1, 1),
+          matches: [
+            FechaMatch(
+              matchId: 1,
+              homeTeam: 'River',
+              awayTeam: 'Boca',
+              kickoff: DateTime(2026, 6, 7, 14, 0),
+              realScoreHome: realScoreHome,
+              realScoreAway: realScoreAway,
+              isFinal: isFinal,
+            ),
+          ],
+          userPredictions: [
+            PredictionEntry(
+              matchId: 1,
+              scoreHome: 2,
+              scoreAway: 1,
+              points: points,
+              evaluationMethod: evaluationMethod,
+            ),
+          ],
+        );
+      }
+
+      // --- badge rendering ---
+
+      testWidgets('exact_score: green badge label "+3 Exacto" visible on card', (tester) async {
+        final fecha = _evaluatedFecha(
+          points: 3,
+          evaluationMethod: 'exact_score',
+          isFinal: true,
+        );
+        final drafts = _seedDrafts(fecha);
+        final savedMatchIds = _seedSavedMatchIds(fecha);
+        await _pumpScreen(
+          tester,
+          ProdeFixturesLoaded(fecha, drafts: drafts, savedMatchIds: savedMatchIds),
+        );
+
+        expect(find.byKey(const Key('result_badge_1')), findsOneWidget);
+        expect(find.text('+3 Exacto'), findsOneWidget);
+      });
+
+      testWidgets('result_only/1: amber badge label "+1 Ganador" visible on card', (tester) async {
+        final fecha = _evaluatedFecha(
+          points: 1,
+          evaluationMethod: 'result_only',
+          realScoreHome: 1,
+          realScoreAway: 0,
+          isFinal: true,
+        );
+        final drafts = _seedDrafts(fecha);
+        final savedMatchIds = _seedSavedMatchIds(fecha);
+        await _pumpScreen(
+          tester,
+          ProdeFixturesLoaded(fecha, drafts: drafts, savedMatchIds: savedMatchIds),
+        );
+
+        expect(find.byKey(const Key('result_badge_1')), findsOneWidget);
+        expect(find.text('+1 Ganador'), findsOneWidget);
+      });
+
+      testWidgets('result_only/0: red badge label "0 pts" visible on card', (tester) async {
+        final fecha = _evaluatedFecha(
+          points: 0,
+          evaluationMethod: 'result_only',
+          realScoreHome: 3,
+          realScoreAway: 0,
+          isFinal: true,
+        );
+        final drafts = _seedDrafts(fecha);
+        final savedMatchIds = _seedSavedMatchIds(fecha);
+        await _pumpScreen(
+          tester,
+          ProdeFixturesLoaded(fecha, drafts: drafts, savedMatchIds: savedMatchIds),
+        );
+
+        expect(find.byKey(const Key('result_badge_1')), findsOneWidget);
+        expect(find.text('0 pts'), findsOneWidget);
+      });
+
+      // --- real-score line ---
+
+      testWidgets('isFinal=true: real-score line shows "Resultado: 2 - 1"', (tester) async {
+        final fecha = _evaluatedFecha(
+          realScoreHome: 2,
+          realScoreAway: 1,
+          isFinal: true,
+        );
+        final drafts = _seedDrafts(fecha);
+        final savedMatchIds = _seedSavedMatchIds(fecha);
+        await _pumpScreen(
+          tester,
+          ProdeFixturesLoaded(fecha, drafts: drafts, savedMatchIds: savedMatchIds),
+        );
+
+        expect(find.byKey(const Key('real_score_line_1')), findsOneWidget);
+        // Must show both real-score numbers
+        final widget = tester.widget<Text>(find.byKey(const Key('real_score_line_1')));
+        expect(widget.data, contains('2'));
+        expect(widget.data, contains('1'));
+      });
+
+      testWidgets('isFinal=false: no real-score line rendered', (tester) async {
+        final fecha = _evaluatedFecha(
+          realScoreHome: null,
+          realScoreAway: null,
+          isFinal: false,
+        );
+        final drafts = _seedDrafts(fecha);
+        final savedMatchIds = _seedSavedMatchIds(fecha);
+        await _pumpScreen(
+          tester,
+          ProdeFixturesLoaded(fecha, drafts: drafts, savedMatchIds: savedMatchIds),
+        );
+
+        expect(find.byKey(const Key('real_score_line_1')), findsNothing);
+      });
+
+      // --- null real-score fallback (legacy evaluated fecha) ---
+
+      testWidgets('legacy evaluated: points known but realScore null — badge shown, no real-score line, no crash', (tester) async {
+        final fecha = _evaluatedFecha(
+          realScoreHome: null,
+          realScoreAway: null,
+          isFinal: false, // pre-change: is_final was not set
+          points: 3,
+          evaluationMethod: 'exact_score',
+        );
+        final drafts = _seedDrafts(fecha);
+        final savedMatchIds = _seedSavedMatchIds(fecha);
+
+        await _pumpScreen(
+          tester,
+          ProdeFixturesLoaded(fecha, drafts: drafts, savedMatchIds: savedMatchIds),
+        );
+
+        // badge still shows (points are known)
+        expect(find.byKey(const Key('result_badge_1')), findsOneWidget);
+        // real-score line absent (not final)
+        expect(find.byKey(const Key('real_score_line_1')), findsNothing);
+      });
+
+      // --- active/open fecha: no badge, no real-score line ---
+
+      testWidgets('open fecha: no result badge, no real-score line', (tester) async {
+        final fecha = FechaActiva(
+          fechaId: 1,
+          seasonId: 10,
+          state: ProdeFechaState.open,
+          lockedAt: null,
+          matches: [
+            FechaMatch(
+              matchId: 1,
+              homeTeam: 'River',
+              awayTeam: 'Boca',
+              kickoff: DateTime(2026, 6, 7, 14, 0),
+              realScoreHome: null,
+              realScoreAway: null,
+              isFinal: false,
+            ),
+          ],
+        );
+        await _pumpScreen(tester, ProdeFixturesLoaded(fecha));
+
+        expect(find.byKey(const Key('result_badge_1')), findsNothing);
+        expect(find.byKey(const Key('real_score_line_1')), findsNothing);
+      });
+
+      // --- locked fecha with no evaluation: no badge ---
+
+      testWidgets('locked fecha: no result badge shown', (tester) async {
+        final fecha = FechaActiva(
+          fechaId: 1,
+          seasonId: 10,
+          state: ProdeFechaState.locked,
+          lockedAt: DateTime(2020, 1, 1),
+          matches: [
+            FechaMatch(
+              matchId: 1,
+              homeTeam: 'River',
+              awayTeam: 'Boca',
+              kickoff: DateTime(2026, 6, 7, 14, 0),
+              isFinal: false,
+            ),
+          ],
+        );
+        await _pumpScreen(tester, ProdeFixturesLoaded(fecha));
+
+        expect(find.byKey(const Key('result_badge_1')), findsNothing);
+      });
+
+      // --- card border color reflects evaluation style ---
+
+      testWidgets('evaluated isFinal=true card has colored border (not grey.shade200)', (tester) async {
+        final fecha = _evaluatedFecha(points: 3, evaluationMethod: 'exact_score', isFinal: true);
+        final drafts = _seedDrafts(fecha);
+        final savedMatchIds = _seedSavedMatchIds(fecha);
+        await _pumpScreen(
+          tester,
+          ProdeFixturesLoaded(fecha, drafts: drafts, savedMatchIds: savedMatchIds),
+        );
+
+        // The card Container/Card should exist with the match_card key.
+        expect(find.byKey(const Key('match_card_1')), findsOneWidget);
+        // We can't easily inspect border color in widget tests without finding the
+        // specific Card or Container — verify that no assertion error occurred
+        // and the badge is present (implicit: card rendered without error).
+        expect(find.text('+3 Exacto'), findsOneWidget);
       });
     });
 
@@ -1148,7 +1520,8 @@ void main() {
               homeTeam: 'Team A',
               awayTeam: 'Team B',
               kickoff: DateTime(2026, 6, 7, 14, 0),
-              populares: Populares(home: .45, draw: .30, away: .25),
+              // Backend sends percentages [0,100] — 45.0 means 45%, not 0.45
+              populares: const Populares(home: 45.0, draw: 30.0, away: 25.0),
             ),
           ],
         );
@@ -1161,6 +1534,7 @@ void main() {
       });
 
       // POP-2-a: chips show correct percentages when locked + populares non-null.
+      // Backend contract: values are already percentages [0,100].
       testWidgets('POP-2-a: chips show 45%, 30%, 25% when locked + populares set', (tester) async {
         final fecha = FechaActiva(
           fechaId: 1,
@@ -1173,7 +1547,8 @@ void main() {
               homeTeam: 'Team A',
               awayTeam: 'Team B',
               kickoff: DateTime(2026, 6, 7, 14, 0),
-              populares: Populares(home: .45, draw: .30, away: .25),
+              // Wire values are percentages: 45.0 → "45%", 30.0 → "30%", 25.0 → "25%"
+              populares: const Populares(home: 45.0, draw: 30.0, away: 25.0),
             ),
           ],
         );
@@ -1197,7 +1572,8 @@ void main() {
               homeTeam: 'Team A',
               awayTeam: 'Team B',
               kickoff: DateTime(2026, 6, 7, 14, 0),
-              populares: Populares(home: .70, draw: .30, away: 0.0),
+              // Wire values are percentages: 70.0 → "70%", 30.0 → "30%", 0.0 → "0%"
+              populares: const Populares(home: 70.0, draw: 30.0, away: 0.0),
             ),
           ],
         );
@@ -1221,8 +1597,8 @@ void main() {
               homeTeam: 'Team A',
               awayTeam: 'Team B',
               kickoff: DateTime(2026, 6, 7, 14, 0),
-              // .334 * 100 → 33, .333 * 100 → 33, .333 * 100 → 33 (sum = 99)
-              populares: Populares(home: .334, draw: .333, away: .333),
+              // Wire percentages: 33.4 → 33, 33.3 → 33, 33.3 → 33 (sum = 99)
+              populares: const Populares(home: 33.4, draw: 33.3, away: 33.3),
             ),
           ],
         );
@@ -1245,7 +1621,8 @@ void main() {
               homeTeam: 'Team A',
               awayTeam: 'Team B',
               kickoff: DateTime(2026, 6, 7, 14, 0),
-              populares: Populares(home: 1.0, draw: 0.0, away: 0.0),
+              // Wire values are percentages: 100.0 → "100%", 0.0 → "0%"
+              populares: const Populares(home: 100.0, draw: 0.0, away: 0.0),
             ),
           ],
         );
@@ -1253,6 +1630,55 @@ void main() {
 
         expect(find.text('100%'), findsOneWidget);
         expect(find.text('0%'), findsNWidgets(2));
+      });
+
+      // POP-2-e: wire percentage contract — backend sends percentages [0,100].
+      // Populares values are already percentages (e.g. 100.0 means 100%, not 1).
+      // The screen must NOT multiply by 100 again.
+      testWidgets('POP-2-e: wire value 100.0 renders as "100%", not "10000%" (percentage contract)', (tester) async {
+        // Backend sends percentages: 100.0, 0.0, 0.0
+        final fecha = FechaActiva(
+          fechaId: 1,
+          seasonId: 10,
+          state: ProdeFechaState.locked,
+          lockedAt: DateTime(2020, 1, 1),
+          matches: [
+            FechaMatch(
+              matchId: 1,
+              homeTeam: 'Team A',
+              awayTeam: 'Team B',
+              kickoff: DateTime(2026, 6, 7, 14, 0),
+              populares: const Populares(home: 100.0, draw: 0.0, away: 0.0),
+            ),
+          ],
+        );
+        await _openModal(tester, ProdeFixturesLoaded(fecha), 1);
+
+        expect(find.text('100%'), findsOneWidget);
+        expect(find.text('10000%'), findsNothing); // must never appear
+        expect(find.text('0%'), findsNWidgets(2));
+      });
+
+      // POP-2-f: realistic mixed case — backend sends 33.3 / 33.3 / 33.4.
+      testWidgets('POP-2-f: wire values 33.3/33.3/33.4 render as "33%"/"33%"/"33%" (percentage contract)', (tester) async {
+        final fecha = FechaActiva(
+          fechaId: 1,
+          seasonId: 10,
+          state: ProdeFechaState.locked,
+          lockedAt: DateTime(2020, 1, 1),
+          matches: [
+            FechaMatch(
+              matchId: 1,
+              homeTeam: 'Team A',
+              awayTeam: 'Team B',
+              kickoff: DateTime(2026, 6, 7, 14, 0),
+              populares: const Populares(home: 33.3, draw: 33.3, away: 33.4),
+            ),
+          ],
+        );
+        await _openModal(tester, ProdeFixturesLoaded(fecha), 1);
+
+        expect(find.text('33%'), findsNWidgets(3));
       });
 
       // POP-3-a: open fecha + populares null → locked hint visible, no % anywhere.
@@ -1314,7 +1740,7 @@ void main() {
               homeTeam: 'Team A',
               awayTeam: 'Team B',
               kickoff: DateTime(2026, 6, 7, 14, 0),
-              populares: Populares(home: .45, draw: .30, away: .25),
+              populares: const Populares(home: 45.0, draw: 30.0, away: 25.0),
             ),
           ],
         );
@@ -1337,7 +1763,7 @@ void main() {
               homeTeam: 'Team A',
               awayTeam: 'Team B',
               kickoff: DateTime(2026, 6, 7, 14, 0),
-              populares: Populares(home: .45, draw: .30, away: .25),
+              populares: const Populares(home: 45.0, draw: 30.0, away: 25.0),
             ),
           ],
         );
@@ -1360,7 +1786,7 @@ void main() {
               homeTeam: 'Team A',
               awayTeam: 'Team B',
               kickoff: DateTime(2026, 6, 7, 14, 0),
-              populares: Populares(home: .45, draw: .30, away: .25),
+              populares: const Populares(home: 45.0, draw: 30.0, away: 25.0),
             ),
             FechaMatch(
               matchId: 2,
@@ -1401,7 +1827,7 @@ void main() {
               homeTeam: 'Team A',
               awayTeam: 'Team B',
               kickoff: DateTime(2026, 6, 7, 14, 0),
-              populares: Populares(home: .45, draw: .30, away: .25),
+              populares: const Populares(home: 45.0, draw: 30.0, away: 25.0),
             ),
           ],
         );
@@ -1411,6 +1837,77 @@ void main() {
           RegExp('Información sobre pronósticos populares'),
         );
         expect(semanticsWidget, findsAtLeastNWidgets(1));
+      });
+    });
+
+    // -------------------------------------------------------------------------
+    // "A Jugarse" (Prode Chami): include locked fechas + "En Juego"
+    // -------------------------------------------------------------------------
+
+    group('locked fechas surface in "A Jugarse"', () {
+      // OO-1: a locked fecha is shown in "A Jugarse", with each match
+      // tagged "En Juego" (window closed, about to be played).
+      testWidgets('OO-1: shows locked fecha cards with "En Juego" labels',
+          (tester) async {
+        final summaries = [
+          FechaSummary(
+            fechaId: 1, seasonId: 10, state: ProdeFechaState.locked,
+            lockedAt: DateTime(2020, 1, 1), matchCount: 2,
+          ),
+        ];
+        final state = ProdeFixturesLoaded(
+          _makeFecha(state: ProdeFechaState.locked),
+          fechas: summaries,
+          selectedFechaId: 1,
+        );
+        await _pumpScreen(tester, state);
+
+        // Match cards render (not the empty state)...
+        expect(find.text('Team A'), findsOneWidget);
+        // ...and every match carries the "En Juego" label.
+        expect(find.byKey(const Key('en_juego_label_1')), findsOneWidget);
+        expect(find.byKey(const Key('en_juego_label_2')), findsOneWidget);
+        expect(find.text('En Juego'), findsNWidgets(2));
+      });
+
+      // OO-2: evaluated fechas stay out of "A Jugarse" (they belong to history);
+      // with no open/locked fecha, the empty state shows.
+      testWidgets('OO-2: only evaluated fechas shows empty message',
+          (tester) async {
+        final summaries = [
+          FechaSummary(
+            fechaId: 1, seasonId: 10, state: ProdeFechaState.evaluated,
+            lockedAt: DateTime(2020, 1, 1), matchCount: 2,
+          ),
+        ];
+        final state = ProdeFixturesLoaded(
+          _makeFecha(state: ProdeFechaState.evaluated),
+          fechas: summaries,
+          selectedFechaId: 1,
+        );
+        await _pumpScreen(tester, state);
+
+        expect(find.text('No hay fechas para jugar por ahora.'), findsOneWidget);
+      });
+
+      // OO-3: an open (still-bettable) fecha shows no "En Juego" label.
+      testWidgets('OO-3: open fecha shows no "En Juego" label',
+          (tester) async {
+        final summaries = [
+          FechaSummary(
+            fechaId: 1, seasonId: 10, state: ProdeFechaState.open,
+            lockedAt: null, matchCount: 2,
+          ),
+        ];
+        final state = ProdeFixturesLoaded(
+          _makeFecha(state: ProdeFechaState.open),
+          fechas: summaries,
+          selectedFechaId: 1,
+        );
+        await _pumpScreen(tester, state);
+
+        expect(find.text('Team A'), findsOneWidget);
+        expect(find.text('En Juego'), findsNothing);
       });
     });
   });

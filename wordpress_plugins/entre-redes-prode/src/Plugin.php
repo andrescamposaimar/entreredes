@@ -73,7 +73,8 @@ final class Plugin {
             $prediction_controller = new Rest\PredictionController(
                 $pred_repo,
                 $fecha_repo,
-                $middleware
+                $middleware,
+                new Audit\AuditLogger()
             );
 
             // G3: admin endpoint for manual fecha evaluation (ADR-G3-4).
@@ -83,11 +84,13 @@ final class Plugin {
             // G4: ranking endpoint (PR-G4-C).
             $ranking_repo       = new Scoring\RankingRepository( $wpdb );
             $ranking_computer   = new Scoring\RankingComputer();
+            $roster_resolver    = new Scoring\WpRosterResolver( $ranking_repo );
             $ranking_controller = new Rest\RankingController(
                 $ranking_repo,
                 $ranking_computer,
                 new Fecha\Settings( $wpdb ),
-                $middleware
+                $middleware,
+                $roster_resolver
             );
 
             // G6-b: multi-fecha navigation endpoints (PR-G6-B).
@@ -100,6 +103,15 @@ final class Plugin {
                 $pred_repo
             );
 
+            // Prediction history endpoint: GET /prode/predicciones (paginated "Anteriores" list).
+            $prediction_history_controller = new Rest\PredictionHistoryController(
+                $pred_repo,
+                $middleware
+            );
+
+            // Populares endpoint: GET /prode/populares (prediction split for one match).
+            $populares_controller = new Rest\PopularesController( $pred_repo );
+
             $controller = new Rest\RestController(
                 $auth_endpoints,
                 $account_controller,
@@ -107,10 +119,30 @@ final class Plugin {
                 $prediction_controller,
                 $evaluation_controller,
                 $ranking_controller,
-                $fecha_list_controller
+                $fecha_list_controller,
+                $prediction_history_controller,
+                $populares_controller
             );
             $controller->register_routes();
         } );
+
+        // 2b. Never let a shared HTTP cache store a /prode/ response.
+        //
+        //     Every /prode/ payload is caller-specific: GET /prode/fecha-activa and
+        //     GET /prode/fecha/{id} embed the caller's own user_predictions, /prode/ranking
+        //     embeds their `me` row, and /prode/auth/* returns their tokens. Callers
+        //     authenticate with a Bearer token and send no WordPress session cookie, so a
+        //     URL-keyed reverse proxy that only bypasses on that cookie treats every
+        //     request as anonymous — and serves one user's predictions to everyone else
+        //     for the lifetime of the cache entry. Observed in production 2026-09-07:
+        //     an invalid Bearer token returned 200 with `x-cache-status: HIT` instead of 401.
+        //
+        //     The response header is the half we control from the plugin: it travels with
+        //     the code and survives a hosting, proxy or CDN change. Vary is declared too so
+        //     a cache that does key on request headers splits per token instead of ignoring
+        //     it. The upstream proxy must still be configured to honour this — the plugin
+        //     cannot force it, which is why the header is a floor and not the whole fix.
+        add_filter( 'rest_post_dispatch', [ self::class, 'denyProdeResponseCaching' ], 10, 3 );
 
         // 3. WP-CLI commands — guarded so the command class is only loaded in CLI context.
         if ( defined( 'WP_CLI' ) && WP_CLI ) {
@@ -162,11 +194,20 @@ final class Plugin {
                 };
                 $repairService    = new Admin\RepairDisplayNamesService( $wpdb, $playerNameByIdFn );
 
-                $settingsPage = new Admin\SettingsPage( $settingsRepo, $seedService, $repairService );
+                // Backfills home_team/away_team snapshots on fecha-match rows that
+                // still have empty names (seeded before v0.5.2). Uses the same
+                // production dispatcher as the daily cron so team names are resolved
+                // from the /partidos endpoint on demand.
+                $backfillService  = new Fecha\BackfillMatchMetaService( $wpdb, Cron\BackfillMatchMetaCron::defaultDispatcher() );
+
+                $predRepo        = new Predictions\PredictionRepository( $wpdb );
+                $predictionsPage = new Admin\PredictionsPage( $predRepo, $registryRepo, new Fecha\FechaResolver() );
+
+                $settingsPage = new Admin\SettingsPage( $settingsRepo, $seedService, $repairService, $backfillService );
                 $registryPage = new Admin\RegistryPage( $registryRepo, $auditLogger, $hasher );
                 $auditLogPage = new Admin\AuditLogPage( $auditLogRepo );
 
-                $adminMenu = new Admin\AdminMenu( $settingsPage, $registryPage, $auditLogPage );
+                $adminMenu = new Admin\AdminMenu( $settingsPage, $registryPage, $auditLogPage, $predictionsPage );
                 $adminMenu->register();
             } );
         }
@@ -221,5 +262,44 @@ final class Plugin {
             false,
             dirname( plugin_basename( ENTRE_REDES_PRODE_FILE ) ) . '/languages'
         );
+    }
+
+    /**
+     * Mark every /entre-redes/v1/prode/ REST response as uncacheable.
+     *
+     * Registered on `rest_post_dispatch`. Responses outside the prode namespace are
+     * returned untouched, so the public read-only endpoints stay cacheable.
+     *
+     * `Vary: Authorization` is appended rather than replaced: WordPress already sets
+     * `Vary: Origin` for CORS, and WP_HTTP_Response::header() with $replace = false
+     * concatenates instead of overwriting.
+     *
+     * @param \WP_HTTP_Response|mixed $response Result to send to the client.
+     * @param \WP_REST_Server|mixed   $server   Server instance (unused).
+     * @param \WP_REST_Request|mixed  $request  Request used to generate the response.
+     * @return \WP_HTTP_Response|mixed
+     */
+    public static function denyProdeResponseCaching( $response, $server, $request ) {
+        // Duck-typed on purpose: rest_post_dispatch is documented to pass a
+        // WP_HTTP_Response, but anything carrying header() and get_route() is enough
+        // here — and it keeps the filter testable against a shim that does not model
+        // WordPress's response class hierarchy.
+        if ( ! is_object( $response ) || ! method_exists( $response, 'header' ) ) {
+            return $response;
+        }
+
+        if ( ! is_object( $request ) || ! method_exists( $request, 'get_route' ) ) {
+            return $response;
+        }
+
+        if ( ! str_starts_with( (string) $request->get_route(), '/entre-redes/v1/prode/' ) ) {
+            return $response;
+        }
+
+        $response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0, private' );
+        $response->header( 'Pragma', 'no-cache' );
+        $response->header( 'Vary', 'Authorization', false );
+
+        return $response;
     }
 }

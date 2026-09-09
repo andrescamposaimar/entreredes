@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../models/prode_ranking.dart';
 import '../../providers/prode_providers.dart';
 import '../../services/prode_ranking_controller.dart';
+import '../../widgets/prode_segmented_toggle.dart';
 
 // ---------------------------------------------------------------------------
 // Container
@@ -23,10 +24,21 @@ import '../../services/prode_ranking_controller.dart';
 /// does NOT clobber the existing state.
 ///
 /// Owns its own Scaffold + AppBar (unlike ProdeFixturesScreen which nests
-/// inside ProdeAuthGate's Scaffold) because this screen is pushed standalone
-/// from MoreScreen via Navigator.push.
+/// inside ProdeAuthGate's Scaffold) because this screen is pushed standalone.
+///
+/// Two tabs via [ProdeSegmentedToggle]:
+///   - "Fecha Actual" — ranking counting only the last evaluated fecha's points
+///     ([prodeFechaRankingControllerProvider]).
+///   - "General"      — season-cumulative ranking
+///     ([prodeRankingControllerProvider]).
+///
+/// [initialTab] lets the caller deep-link to a specific tab (e.g. the Prode
+/// summary card opens "Fecha Actual" or "General" depending on which half the
+/// user tapped). 0 = Fecha Actual, 1 = General.
 class ProdeRankingScreen extends ConsumerStatefulWidget {
-  const ProdeRankingScreen({super.key});
+  final int initialTab;
+
+  const ProdeRankingScreen({super.key, this.initialTab = 0});
 
   @override
   ConsumerState<ProdeRankingScreen> createState() =>
@@ -34,31 +46,64 @@ class ProdeRankingScreen extends ConsumerStatefulWidget {
 }
 
 class _ProdeRankingScreenState extends ConsumerState<ProdeRankingScreen> {
+  late int _tab = widget.initialTab;
+
   @override
   void initState() {
     super.initState();
-    // Only trigger load from the initial Loading state. Re-entry while
-    // Loaded/Empty/Error must NOT clobber that state with a fresh fetch.
-    if (ref.read(prodeRankingControllerProvider) is ProdeRankingLoading) {
-      Future.microtask(() {
-        if (mounted) {
-          ref.read(prodeRankingControllerProvider.notifier).load();
-        }
-      });
-    }
+    // Trigger each controller's load only from its initial Loading state so
+    // re-entry does not clobber an already-loaded tab.
+    Future.microtask(() {
+      if (!mounted) return;
+      if (ref.read(prodeFechaRankingControllerProvider)
+          is ProdeRankingLoading) {
+        ref.read(prodeFechaRankingControllerProvider.notifier).load();
+      }
+      if (ref.read(prodeRankingControllerProvider) is ProdeRankingLoading) {
+        ref.read(prodeRankingControllerProvider.notifier).load();
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    final state = ref.watch(prodeRankingControllerProvider);
-    final notifier = ref.read(prodeRankingControllerProvider.notifier);
+    final fechaState = ref.watch(prodeFechaRankingControllerProvider);
+    final generalState = ref.watch(prodeRankingControllerProvider);
+    final fechaNotifier = ref.read(prodeFechaRankingControllerProvider.notifier);
+    final generalNotifier = ref.read(prodeRankingControllerProvider.notifier);
+
+    final showingFecha = _tab == 0;
+    final state = showingFecha ? fechaState : generalState;
+    // Both tear-offs share the Future<void> Function() signature, so the
+    // ternary resolves cleanly even though the notifiers are different types.
+    final Future<void> Function() onRefresh =
+        showingFecha ? fechaNotifier.refresh : generalNotifier.refresh;
+    final VoidCallback onRetry =
+        showingFecha ? fechaNotifier.load : generalNotifier.load;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Ranking')),
-      body: ProdeRankingView(
-        state: state,
-        onRetry: notifier.load,
-        onRefresh: notifier.refresh,
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            child: ProdeSegmentedToggle(
+              labels: const ['Fecha Actual', 'General'],
+              selectedIndex: _tab,
+              onChanged: (i) => setState(() => _tab = i),
+            ),
+          ),
+          Expanded(
+            child: ProdeRankingView(
+              // Key forces a subtree swap so the RefreshIndicator/list state of
+              // one tab never bleeds into the other.
+              key: ValueKey(showingFecha ? 'ranking_fecha' : 'ranking_general'),
+              state: state,
+              onRetry: onRetry,
+              onRefresh: onRefresh,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -183,14 +228,28 @@ class _ErrorView extends StatelessWidget {
 // Row widget
 // ---------------------------------------------------------------------------
 
-/// A single leaderboard row showing rank badge, player name, exact count,
-/// and total points.
+/// A single leaderboard row showing rank badge, user photo, player name,
+/// team/club, and total points.
+///
+/// Layout (left → right):
+///   [rank badge] [user photo] [name / team column] ... [pts]
+///
+/// The user photo is a [CircleAvatar] using [NetworkImage] when [entry.avatarUrl]
+/// is non-empty, falling back to the first letter of [entry.displayName] as
+/// initials on missing URL or image-load error — mirroring the pattern in
+/// `ProdeIdentityCard._buildAuthenticatedTile`.
+///
+/// The subtitle line shows [entry.teamName] when non-empty, or the literal
+/// `'Sin Equipo'` otherwise. The old "N exactos" subtitle has been removed.
 ///
 /// The `is_me` row is visually distinguished via a tinted Container background
 /// and bold display name (ADR-G5-8 — no auto-scroll).
 ///
 /// The outermost widget carries `Key('ranking_row_${entry.userId}')` so
-/// widget tests can locate rows by user id.
+/// widget tests can locate rows by user id. The avatar carries
+/// `ValueKey('ranking_avatar_photo_${entry.userId}')` or
+/// `ValueKey('ranking_avatar_initials_${entry.userId}')` so tests can assert
+/// which variant is rendered.
 class _RankingRow extends StatelessWidget {
   final RankingEntry entry;
 
@@ -202,6 +261,38 @@ class _RankingRow extends StatelessWidget {
     final isMeColor = entry.isMe
         ? theme.colorScheme.primary.withValues(alpha: 0.12)
         : null;
+
+    final hasPhoto =
+        entry.avatarUrl != null && entry.avatarUrl!.isNotEmpty;
+
+    // Initials child — always present; shown when photo is absent or fails.
+    final initialsChild = Text(
+      entry.displayName.isNotEmpty
+          ? entry.displayName[0].toUpperCase()
+          : '?',
+      style: TextStyle(
+        color: theme.colorScheme.primary,
+        fontWeight: FontWeight.bold,
+        fontSize: 13,
+      ),
+    );
+
+    final Widget userAvatar = CircleAvatar(
+      key: hasPhoto
+          ? ValueKey('ranking_avatar_photo_${entry.userId}')
+          : ValueKey('ranking_avatar_initials_${entry.userId}'),
+      radius: 18,
+      foregroundImage: hasPhoto ? NetworkImage(entry.avatarUrl!) : null,
+      // Swallow load errors — initials remain visible underneath.
+      onForegroundImageError: hasPhoto ? (_, __) {} : null,
+      backgroundColor: theme.colorScheme.primary.withValues(alpha: 0.15),
+      child: initialsChild,
+    );
+
+    final teamLabel =
+        (entry.teamName != null && entry.teamName!.isNotEmpty)
+            ? entry.teamName!
+            : 'Sin Equipo';
 
     return Container(
       key: Key('ranking_row_${entry.userId}'),
@@ -225,8 +316,11 @@ class _RankingRow extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(width: 12),
-          // Name + exact count
+          const SizedBox(width: 8),
+          // User photo
+          userAvatar,
+          const SizedBox(width: 10),
+          // Name + team
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -241,7 +335,9 @@ class _RankingRow extends StatelessWidget {
                   ),
                 ),
                 Text(
-                  '${entry.exactCount} exactos',
+                  teamLabel,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: theme.textTheme.bodySmall
                       ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
                 ),

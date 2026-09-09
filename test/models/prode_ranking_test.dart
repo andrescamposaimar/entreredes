@@ -12,6 +12,8 @@ Map<String, dynamic> _entryJson({
   int rank = 1,
   int exactCount = 2,
   bool isMe = false,
+  String? avatarUrl,
+  String? teamName,
 }) {
   return {
     'user_id': userId,
@@ -20,6 +22,8 @@ Map<String, dynamic> _entryJson({
     'rank': rank,
     'exact_count': exactCount,
     'is_me': isMe,
+    if (avatarUrl != null) 'avatar_url': avatarUrl,
+    if (teamName != null) 'team_name': teamName,
   };
 }
 
@@ -93,6 +97,51 @@ void main() {
       final entry = RankingEntry.fromJson(_entryJson(userId: 99));
       expect(entry.toString(), contains('99'));
     });
+
+    test('avatar_url and team_name parsed when present', () {
+      final json = _entryJson(
+        avatarUrl: 'https://example.com/avatar.jpg',
+        teamName: 'Club Atlético',
+      );
+      final entry = RankingEntry.fromJson(json);
+      expect(entry.avatarUrl, 'https://example.com/avatar.jpg');
+      expect(entry.teamName, 'Club Atlético');
+    });
+
+    test('avatar_url absent → avatarUrl is null', () {
+      final entry = RankingEntry.fromJson(_entryJson());
+      expect(entry.avatarUrl, isNull);
+    });
+
+    test('team_name absent → teamName is null', () {
+      final entry = RankingEntry.fromJson(_entryJson());
+      expect(entry.teamName, isNull);
+    });
+
+    test('avatar_url null value → avatarUrl is null', () {
+      final json = Map<String, dynamic>.from(_entryJson());
+      json['avatar_url'] = null;
+      final entry = RankingEntry.fromJson(json);
+      expect(entry.avatarUrl, isNull);
+    });
+
+    test('team_name null value → teamName is null', () {
+      final json = Map<String, dynamic>.from(_entryJson());
+      json['team_name'] = null;
+      final entry = RankingEntry.fromJson(json);
+      expect(entry.teamName, isNull);
+    });
+
+    test('== considers avatarUrl and teamName', () {
+      final e1 = RankingEntry.fromJson(
+          _entryJson(avatarUrl: 'https://x.com/a.jpg', teamName: 'Boca'));
+      final e2 = RankingEntry.fromJson(
+          _entryJson(avatarUrl: 'https://x.com/a.jpg', teamName: 'Boca'));
+      final e3 = RankingEntry.fromJson(
+          _entryJson(avatarUrl: 'https://x.com/b.jpg', teamName: 'Boca'));
+      expect(e1, e2);
+      expect(e1 == e3, false);
+    });
   });
 
   group('RankingPage.fromJson', () {
@@ -138,6 +187,41 @@ void main() {
       expect(p1, p2);
       expect(p1.hashCode, p2.hashCode);
       expect(p1 == p3, false);
+    });
+
+    test('me absent → page.me is null', () {
+      final page = RankingPage.fromJson(_pageJson(items: []));
+      expect(page.me, isNull);
+    });
+
+    test('me null → page.me is null', () {
+      final json = _pageJson(items: []);
+      json['me'] = null;
+      final page = RankingPage.fromJson(json);
+      expect(page.me, isNull);
+    });
+
+    test('me present → parsed into RankingMe with rank/points/exact', () {
+      final json = _pageJson(items: []);
+      json['me'] = {
+        'user_id': 7,
+        'rank': 25,
+        'total_points': 33,
+        'exact_count': 4,
+      };
+      final page = RankingPage.fromJson(json);
+      expect(page.me, isNotNull);
+      expect(page.me!.userId, 7);
+      expect(page.me!.rank, 25);
+      expect(page.me!.totalPoints, 33);
+      expect(page.me!.exactCount, 4);
+    });
+
+    test('me without exact_count → defaults to 0', () {
+      final json = _pageJson(items: []);
+      json['me'] = {'user_id': 7, 'rank': 1, 'total_points': 6};
+      final page = RankingPage.fromJson(json);
+      expect(page.me!.exactCount, 0);
     });
   });
 }

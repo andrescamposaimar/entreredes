@@ -19,12 +19,22 @@ namespace EntreRedes\Prode\Admin;
  */
 class SettingsRepository {
 
-    /** @var array<string> The five editable setting_keys (CONF-01). */
-    private const SETTING_KEYS = [
+    /**
+     * The editable setting_keys (CONF-01).
+     *
+     * Public because it is the single source of truth for both reading and
+     * writing these rows. SettingsPage::handleSave used to keep its own copy of
+     * this list, so a setting added everywhere else silently failed to persist:
+     * it validated, entered $clean, and was then skipped by the write loop.
+     *
+     * @var array<string>
+     */
+    public const SETTING_KEYS = [
         'lock_hours_before',
         'lock_warning_hours_before',
         'fecha_window_days',
         'prode_season_id',
+        'prode_ranking_from_fecha_id',
         'evaluator_cron_interval_minutes',
     ];
 
@@ -36,7 +46,7 @@ class SettingsRepository {
 
     /**
      * Returns an associative array of setting_key => setting_value for all
-     * five editable prode_settings rows that are present in the DB.
+     * editable prode_settings rows that are present in the DB.
      *
      * Missing rows are simply absent from the returned array; the caller must
      * fall back to Settings::readInt() defaults (CONF-01, EDGE-06).
@@ -158,11 +168,30 @@ class SettingsRepository {
      * Upserts a prode_settings row: UPDATE if row exists, INSERT if absent
      * (EDGE-06: migration may have left a row missing).
      *
-     * Returns true on success, false on DB error.
+     * No-op when the stored value already equals $value (updated_at drift
+     * fix): SettingsPage::handleSaveSettings() re-upserts every editable key
+     * on every Save click regardless of what the operator actually touched,
+     * so an unconditional restamp destroyed updated_at's meaning — it no
+     * longer told the operator WHEN a setting last changed, only when Save
+     * was last clicked. That actively misled a production investigation.
+     *
+     * Returns true on success (including the no-op case), false on DB error.
      */
     public function upsertSetting( string $key, string $value, int $actorWpId ): bool {
-        $now    = current_time( 'mysql' );
-        $p      = $this->wpdb->prefix;
+        $p = $this->wpdb->prefix;
+
+        $currentValue = $this->wpdb->get_var(
+            $this->wpdb->prepare(
+                "SELECT setting_value FROM {$p}prode_settings WHERE setting_key = %s",
+                $key
+            )
+        );
+
+        if ( null !== $currentValue && (string) $currentValue === $value ) {
+            return true; // Unchanged — updated_at/updated_by must not move.
+        }
+
+        $now = current_time( 'mysql' );
 
         // Try UPDATE first.
         $updated = $this->wpdb->update(

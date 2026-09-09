@@ -1,11 +1,25 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../config/tenant_provider.dart';
+import '../models/match_populares.dart';
+import '../providers/prode_providers.dart';
 import '../providers/service_providers.dart';
+import '../utils/date_utils.dart';
+import '../utils/text_utils.dart';
 import '../widgets/zocalo_publicitario.dart';
 import '../widgets/full_field_painter.dart';
 import '../widgets/player_pod.dart';
 import 'player_detail_screen.dart';
 
+
+/// A single comparable stat: its label and both teams' values.
+class _Estadistica {
+  final String titulo;
+  final int local;
+  final int visitante;
+
+  const _Estadistica(this.titulo, this.local, this.visitante);
+}
 
 class MatchDetailScreen extends ConsumerStatefulWidget {
   final Map<String, dynamic> partido;
@@ -25,7 +39,12 @@ class _MatchDetailScreenState extends ConsumerState<MatchDetailScreen> with Sing
   String? estadisticasAdUrl;
   String? alineacionesAdUrl;
 
-  bool _goleadoresCargados = false;
+  MatchPopulares? populares;
+  bool cargandoPopulares = false;
+
+  /// True when the populares request failed. Kept apart from a null result so
+  /// a network error is never reported as "there were no predictions".
+  bool fallaPopulares = false;
 
   bool get _esFuturo => widget.partido['status'] == 'future';
 
@@ -46,6 +65,7 @@ class _MatchDetailScreenState extends ConsumerState<MatchDetailScreen> with Sing
     // Solo cargar goleadores si el partido ya se disputó
     if (!_esFuturo) {
       _loadGoleadores();
+      _loadPopulares();
     } else {
       // Marcar como no cargando para evitar indicadores infinitos
       isLoading = false;
@@ -115,55 +135,382 @@ class _MatchDetailScreenState extends ConsumerState<MatchDetailScreen> with Sing
     }
   }
 
-  Widget _buildResumen() {
+  /// Loads the Prode prediction split for this match.
+  ///
+  /// Guarded by the tenant flag: `prodeApiServiceProvider` throws by design
+  /// when a tenant has Prode disabled, so it must never be read blindly.
+  /// Failures are swallowed — this block is supplementary and must not turn a
+  /// working match detail into an error screen.
+  Future<void> _loadPopulares() async {
+    if (!ref.read(tenantConfigProvider).features.prode) return;
+
+    final matchId = int.tryParse(widget.partido['id']?.toString() ?? '');
+    if (matchId == null || matchId < 1) return;
+
+    setState(() => cargandoPopulares = true);
+
+    try {
+      final resultado =
+          await ref.read(prodeApiServiceProvider).fetchPopulares(matchId);
+      if (!mounted) return;
+      setState(() {
+        populares = resultado;
+        cargandoPopulares = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        fallaPopulares = true;
+        cargandoPopulares = false;
+      });
+    }
+  }
+
+  /// Devuelve el valor como texto listo para mostrar, o null si no hay dato.
+  String? _valorOpcional(dynamic raw) {
+    final texto = decodeHtmlEntities(raw?.toString());
+    return texto.isEmpty ? null : texto;
+  }
+
+  /// La API expone `temporada` como id numérico en algunos endpoints, así que
+  /// solo la mostramos cuando el valor es plausible como año.
+  String? _temporadaLegible(dynamic raw) {
+    final anio = int.tryParse(raw?.toString() ?? '');
+    if (anio == null || anio < 2000 || anio > 2100) return null;
+    return '$anio';
+  }
+
+  Widget _buildInformacion() {
     final p = widget.partido;
 
+    final fechaLarga = formatFechaLarga(p['fecha']?.toString());
+    final hora = _valorOpcional(p['hora']);
+    final temporada = _temporadaLegible(p['temporada']);
+
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Text(
-          '${p['equipo_local']} ${p['goles_local'] ?? '-'} vs ${p['equipo_visitante']} ${p['goles_visitante'] ?? '-'}',
-          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 12),
-        Card(
-          elevation: 4,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: Colors.grey.shade200),
+          ),
           child: Padding(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'Información del partido',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                const Padding(
+                  padding: EdgeInsets.only(top: 8, bottom: 4),
+                  child: Text(
+                    'Información del partido',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
                 ),
-                const SizedBox(height: 16),
-                _buildInfoRow(Icons.calendar_month, 'Fecha', p['fecha'] ?? ''),
-                _buildInfoRow(Icons.access_time, 'Hora', p['hora'] ?? ''),
-                _buildInfoRow(Icons.emoji_events, 'Liga', p['liga'] ?? ''),
-                _buildInfoRow(Icons.timeline, 'Temporada', p['temporada'] ?? '2025'),
-                _buildInfoRow(Icons.location_on, 'Cancha', p['cancha'] ?? ''),
-                _buildInfoRow(Icons.person, 'Árbitro', p['arbitro'] ?? 'No informado'),
+                _buildInfoRow(
+                  Icons.calendar_month,
+                  'Fecha',
+                  fechaLarga ?? _valorOpcional(p['fecha']),
+                ),
+                _buildInfoRow(Icons.access_time, 'Hora', hora == null ? null : '$hora hs'),
+                _buildInfoRow(Icons.emoji_events, 'Liga', _valorOpcional(p['liga'])),
+                if (temporada != null)
+                  _buildInfoRow(Icons.timeline, 'Temporada', temporada),
+                _buildInfoRow(Icons.location_on, 'Cancha', _valorOpcional(p['cancha'])),
               ],
             ),
+          ),
+        ),
+        if (ref.watch(tenantConfigProvider).features.prode) _buildPredicciones(),
+      ],
+    );
+  }
+
+  /// How the Prode crowd called this match.
+  ///
+  /// Renders nothing while loading so the tab does not flash a placeholder,
+  /// and states plainly when a match drew no predictions — silence would read
+  /// as a bug. A failed request hides the block instead: claiming there were
+  /// no predictions when we simply could not ask would be a lie.
+  Widget _buildPredicciones() {
+    if (cargandoPopulares || fallaPopulares) return const SizedBox.shrink();
+
+    final datos = populares;
+    final primary = Theme.of(context).colorScheme.primary;
+
+    Widget encabezado() => Container(
+          width: double.infinity,
+          color: Colors.grey.shade50,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+          child: Row(
+            children: [
+              Icon(Icons.insights, size: 16, color: primary.withValues(alpha: 0.8)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'PREDICCIONES',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.8,
+                    color: Colors.grey.shade700,
+                  ),
+                ),
+              ),
+              if (datos != null && datos.hayDatos)
+                Text(
+                  datos.total == 1 ? '1 pronóstico' : '${datos.total} pronósticos',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                ),
+            ],
+          ),
+        );
+
+    Widget columna(String etiqueta, double porcentaje) => Expanded(
+          child: Column(
+            children: [
+              Text(
+                '${porcentaje.toStringAsFixed(porcentaje == porcentaje.roundToDouble() ? 0 : 1)}%',
+                style: const TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                  color: Colors.black87,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                etiqueta,
+                textAlign: TextAlign.center,
+                // Two lines: team names are longer than "Local" ever was.
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+              ),
+            ],
+          ),
+        );
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 16),
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: Colors.grey.shade200),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            encabezado(),
+            Divider(height: 1, color: Colors.grey.shade200),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+              child: datos != null && datos.hayDatos
+                  ? Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        columna(
+                          decodeHtmlEntities(
+                              widget.partido['equipo_local']?.toString()),
+                          datos.local!,
+                        ),
+                        columna('Empate', datos.empate!),
+                        columna(
+                          decodeHtmlEntities(
+                              widget.partido['equipo_visitante']?.toString()),
+                          datos.visitante!,
+                        ),
+                      ],
+                    )
+                  : Text(
+                      'No hubo predicciones para este partido.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The match hero: crests, score and the scorers of each side, all inside the
+  /// very same block. Empty scorer lists simply drop that half of the panel.
+  Widget _buildScoreboard({
+    required List<String> goleadoresLocal,
+    required List<String> goleadoresVisitante,
+  }) {
+    final p = widget.partido;
+    final primary = Theme.of(context).colorScheme.primary;
+
+    final local = decodeHtmlEntities(p['equipo_local']?.toString());
+    final visitante = decodeHtmlEntities(p['equipo_visitante']?.toString());
+    final golesLocal = int.tryParse(p['goles_local']?.toString() ?? '');
+    final golesVisitante = int.tryParse(p['goles_visitante']?.toString() ?? '');
+
+    final hayGoleadores =
+        goleadoresLocal.isNotEmpty || goleadoresVisitante.isNotEmpty;
+
+    Widget marcador(int? goles) {
+      return Text(
+        goles?.toString() ?? '-',
+        style: const TextStyle(
+          fontSize: 44,
+          fontWeight: FontWeight.w800,
+          color: Colors.black87,
+          height: 1,
+        ),
+      );
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(20),
+        // A whisper of brand colour instead of a saturated block: same family
+        // as the strip on the match list cards.
+        color: primary.withValues(alpha: 0.06),
+        border: Border.all(color: primary.withValues(alpha: 0.12)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 22, 12, 18),
+        child: Column(
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Expanded(
+                  child: _buildEquipoColumna(local, p['escudo_local']?.toString()),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      marcador(golesLocal),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        child: Text(
+                          '-',
+                          style: TextStyle(
+                            fontSize: 30,
+                            fontWeight: FontWeight.w300,
+                            color: Colors.grey.shade400,
+                          ),
+                        ),
+                      ),
+                      marcador(golesVisitante),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: _buildEquipoColumna(
+                    visitante,
+                    p['escudo_visitante']?.toString(),
+                  ),
+                ),
+              ],
+            ),
+            if (hayGoleadores) ...[
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                child: Divider(
+                  height: 1,
+                  thickness: 1,
+                  color: primary.withValues(alpha: 0.15),
+                ),
+              ),
+              _buildGoleadores(goleadoresLocal, goleadoresVisitante),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// A crest framed by a white disc so logos of any colour keep their edge
+  /// against the tinted panel, with the team name underneath.
+  Widget _buildEquipoColumna(String nombre, String? escudoUrl) {
+    final placeholder =
+        Icon(Icons.shield_outlined, size: 34, color: Colors.grey.shade400);
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          height: 62,
+          width: 62,
+          padding: const EdgeInsets.all(7),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.grey.shade200),
+          ),
+          child: escudoUrl != null && escudoUrl.isNotEmpty
+              ? Image.network(
+                  escudoUrl,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => placeholder,
+                )
+              : placeholder,
+        ),
+        const SizedBox(height: 10),
+        Text(
+          nombre,
+          textAlign: TextAlign.center,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+            color: Colors.black87,
+            letterSpacing: 0.3,
           ),
         ),
       ],
     );
   }
 
-  Widget _buildInfoRow(IconData icon, String label, String value) {
+  Widget _buildInfoRow(IconData icon, String label, String? value) {
+    final sinDato = value == null || value.isEmpty;
+    final primary = Theme.of(context).colorScheme.primary;
+
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
+      padding: const EdgeInsets.symmetric(vertical: 10),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          Icon(icon, size: 20, color: Colors.green[800]),
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              color: primary.withValues(alpha: 0.08),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(icon, size: 20, color: primary),
+          ),
           const SizedBox(width: 12),
           Expanded(
-            child: Text(
-              '$label: $value',
-              style: const TextStyle(fontSize: 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  sinDato ? 'No informado' : value,
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: sinDato ? FontWeight.normal : FontWeight.w500,
+                    color: sinDato ? Colors.grey[500] : Colors.black87,
+                  ),
+                ),
+              ],
             ),
           ),
         ],
@@ -183,11 +530,6 @@ class _MatchDetailScreenState extends ConsumerState<MatchDetailScreen> with Sing
     final localStats = goleadores?['equipo_local']['goleadores'] as List<dynamic>? ?? [];
     final visitanteStats = goleadores?['equipo_visitante']['goleadores'] as List<dynamic>? ?? [];
 
-    final equipoLocal = widget.partido['equipo_local'] ?? '';
-    final equipoVisitante = widget.partido['equipo_visitante'] ?? '';
-    final escudoLocal = widget.partido['escudo_local'];
-    final escudoVisitante = widget.partido['escudo_visitante'];
-
     int sum(String key, List<dynamic> jugadores) {
       return jugadores.fold(0, (total, jugador) {
         final raw = jugador[key];
@@ -202,23 +544,6 @@ class _MatchDetailScreenState extends ConsumerState<MatchDetailScreen> with Sing
       });
     }
 
-    Widget statRow(String title, int localVal, int visitanteVal) {
-      return Card(
-        margin: const EdgeInsets.symmetric(vertical: 6),
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('$localVal', style: const TextStyle(fontSize: 16)),
-              Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-              Text('$visitanteVal', style: const TextStyle(fontSize: 16)),
-            ],
-          ),
-        ),
-      );
-    }
-
     final allPlayers = [...localStats, ...visitanteStats];
     final figura = allPlayers.cast<Map<String, dynamic>>().firstWhere(
       (j) => j['figura'] == true,
@@ -228,81 +553,324 @@ class _MatchDetailScreenState extends ConsumerState<MatchDetailScreen> with Sing
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Expanded(child: _buildTeamHeader(equipoLocal, escudoLocal)),
-            const SizedBox(width: 16),
-            Expanded(child: _buildTeamHeader(equipoVisitante, escudoVisitante)),
-          ],
+        _buildScoreboard(
+          goleadoresLocal: _goleadoresDe(localStats),
+          goleadoresVisitante: _goleadoresDe(visitanteStats),
         ),
-        const SizedBox(height: 12),
-        statRow('Goles', sum('goles', localStats), sum('goles', visitanteStats)),
-        statRow('Amarillas', sum('tarjeta_amarilla', localStats), sum('tarjeta_amarilla', visitanteStats)),
-        statRow('Rojas', sum('tarjeta_roja', localStats), sum('tarjeta_roja', visitanteStats)),
+        const SizedBox(height: 20),
+        // Goals are already the headline of the scoreboard above.
+        _buildBloqueEstadisticas([
+          _Estadistica('Amarillas', sum('tarjeta_amarilla', localStats),
+              sum('tarjeta_amarilla', visitanteStats)),
+          _Estadistica('Rojas', sum('tarjeta_roja', localStats),
+              sum('tarjeta_roja', visitanteStats)),
+        ]),
         if (figura.isNotEmpty) _buildFiguraCard(figura),
       ],
     );
   }
 
-  Widget _buildTeamHeader(String nombre, String? escudoUrl) {
-    return Column(
+  /// Surnames of the players who scored, with the goal count when a player
+  /// scored more than once. The API has no minute data, so none is shown.
+  List<String> _goleadoresDe(List<dynamic> jugadores) {
+    final resultado = <String>[];
+    for (final j in jugadores.whereType<Map<String, dynamic>>()) {
+      final goles = int.tryParse(j['goles']?.toString() ?? '') ?? 0;
+      if (goles <= 0) continue;
+      final apellido = (j['nombre']?.toString() ?? '').split(',').first.trim();
+      if (apellido.isEmpty) continue;
+      resultado.add(goles > 1 ? '$apellido ($goles)' : apellido);
+    }
+    return resultado;
+  }
+
+  /// Scorers of each team, split by a ball icon so the column reads as goals.
+  Widget _buildGoleadores(List<String> local, List<String> visitante) {
+    Widget columna(List<String> nombres, CrossAxisAlignment alineacion) {
+      return Column(
+        crossAxisAlignment: alineacion,
+        children: nombres
+            .map((n) => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Text(
+                    n,
+                    textAlign: alineacion == CrossAxisAlignment.end
+                        ? TextAlign.right
+                        : TextAlign.left,
+                    style: TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.grey.shade800,
+                    ),
+                  ),
+                ))
+            .toList(),
+      );
+    }
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        if (escudoUrl != null && escudoUrl.isNotEmpty)
-          Image.network(escudoUrl, height: 40),
-        const SizedBox(height: 4),
-        SizedBox(
-          width: double.infinity,
-          child: Text(
-            nombre,
-            style: const TextStyle(fontWeight: FontWeight.bold),
-            textAlign: TextAlign.center,
-            overflow: TextOverflow.ellipsis,
-            maxLines: 2,
+        Expanded(child: columna(local, CrossAxisAlignment.end)),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          child: Icon(
+            Icons.sports_soccer,
+            size: 17,
+            color: Colors.grey.shade700,
           ),
         ),
+        Expanded(child: columna(visitante, CrossAxisAlignment.start)),
       ],
     );
   }
 
-  Widget _buildFiguraCard(Map<String, dynamic> figura) {
-    final nombre = figura['nombre'] ?? 'Jugador';
-    final equipo = figura['equipo'] ?? '';
-    final puntaje = PlayerPod(jugador: figura).puntajeStr;
-    final foto = (figura['foto'] is String && figura['foto'].toString().isNotEmpty)
-        ? figura['foto']
-        : null;
+  /// All match stats in a single card.
+  ///
+  /// Both sides share the same colour and type weight, so the bars only convey
+  /// proportion — neither team is singled out as the better one.
+  Widget _buildBloqueEstadisticas(List<_Estadistica> estadisticas) {
+    Widget valor(int v) => Text(
+          '$v',
+          style: const TextStyle(
+            fontSize: 20,
+            fontWeight: FontWeight.w800,
+            color: Colors.black87,
+          ),
+        );
 
-    return Card(
-      margin: const EdgeInsets.only(top: 16),
-      child: InkWell(
-        onTap: () {
-          Navigator.pushNamed(context, '/player_detail', arguments: figura);
-        },
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Figura del partido', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-              const SizedBox(height: 8),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: foto != null
-                    ? CircleAvatar(backgroundImage: NetworkImage(foto))
-                    : const Icon(Icons.person),
-                title: Text(nombre),
-                subtitle: Text('Equipo: $equipo'),
-                trailing: Row(
-                  mainAxisSize: MainAxisSize.min,
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.grey.shade200),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 6),
+        child: Column(
+          children: [
+            for (var i = 0; i < estadisticas.length; i++) ...[
+              if (i > 0) Divider(height: 1, color: Colors.grey.withValues(alpha: 0.2)),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Icon(Icons.star, color: Colors.amber),
-                    const SizedBox(width: 4),
-                    Text(puntaje),
+                    valor(estadisticas[i].local),
+                    Text(
+                      estadisticas[i].titulo.toUpperCase(),
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.8,
+                        color: Colors.grey[600],
+                      ),
+                    ),
+                    valor(estadisticas[i].visitante),
                   ],
                 ),
               ),
             ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Opens the player detail screen for [jugadorId].
+  ///
+  /// The match endpoints return a reduced player shape (goals, cards, rating),
+  /// so the full record has to be fetched by id before pushing the screen.
+  Future<void> _abrirDetalleJugador(dynamic jugadorId) async {
+    if (jugadorId == null) return;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
+    );
+
+    try {
+      final jugadorCompleto =
+          await ref.read(apiServiceProvider).getJugadorPorId(jugadorId);
+      if (!mounted) return;
+      Navigator.of(context).pop(); // Quitar loader
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => PlayerDetailScreen(player: jugadorCompleto),
+        ),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      showDialog(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Error'),
+          content: const Text('No se pudo cargar la información del jugador.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  /// The man of the match, given its own gold identity so it stands apart from
+  /// the blue scoreboard above it.
+  Widget _buildFiguraCard(Map<String, dynamic> figura) {
+    final nombre = decodeHtmlEntities(figura['nombre']?.toString()).isEmpty
+        ? 'Jugador'
+        : decodeHtmlEntities(figura['nombre']?.toString());
+    final foto = (figura['foto'] is String && figura['foto'].toString().isNotEmpty)
+        ? figura['foto'].toString()
+        : null;
+
+    // `equipo` on the player is the side marker set while enriching the
+    // scorers ('local' / 'visitante'), not a club name, so resolve the real
+    // name and crest from the match itself.
+    final esLocal = figura['equipo'] == 'local';
+    final equipo = decodeHtmlEntities((esLocal
+            ? widget.partido['equipo_local']
+            : widget.partido['equipo_visitante'])
+        ?.toString());
+    final escudoEquipo = (esLocal
+            ? widget.partido['escudo_local']
+            : widget.partido['escudo_visitante'])
+        ?.toString();
+
+    // Gold stays the identity of the man of the match, but as a tint with dark
+    // type — the same restraint applied to the scoreboard panel.
+    const oro = Color(0xFFB8860B);
+    const oroTexto = Color(0xFF8A6914);
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 20),
+      child: Material(
+        borderRadius: BorderRadius.circular(20),
+        clipBehavior: Clip.antiAlias,
+        child: Ink(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(20),
+            color: oro.withValues(alpha: 0.09),
+            border: Border.all(color: oro.withValues(alpha: 0.28)),
+          ),
+          child: InkWell(
+            onTap: () => _abrirDetalleJugador(figura['id']),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Row(
+                children: [
+                  Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      Container(
+                        width: 64,
+                        height: 64,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white, width: 2.5),
+                          image: foto != null
+                              ? DecorationImage(
+                                  image: NetworkImage(foto), fit: BoxFit.cover)
+                              : null,
+                          color: Colors.grey.shade200,
+                        ),
+                        child: foto == null
+                            ? Icon(Icons.person, color: Colors.grey.shade500, size: 34)
+                            : null,
+                      ),
+                      Positioned(
+                        right: -2,
+                        bottom: -2,
+                        child: Container(
+                          padding: const EdgeInsets.all(4),
+                          decoration: const BoxDecoration(
+                            color: oro,
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(Icons.star, size: 16, color: Colors.white),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'FIGURA DEL PARTIDO',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 1.2,
+                            color: oroTexto,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          nombre,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.black87,
+                          ),
+                        ),
+                        if (equipo.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Row(
+                              children: [
+                                if (escudoEquipo != null && escudoEquipo.isNotEmpty) ...[
+                                  Container(
+                                    width: 22,
+                                    height: 22,
+                                    padding: const EdgeInsets.all(2),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white,
+                                      shape: BoxShape.circle,
+                                      border: Border.all(color: Colors.grey.shade200),
+                                    ),
+                                    child: Image.network(
+                                      escudoEquipo,
+                                      fit: BoxFit.contain,
+                                      errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 7),
+                                ],
+                                Flexible(
+                                  child: Text(
+                                    equipo,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w500,
+                                      color: Colors.grey.shade700,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  Icon(
+                    Icons.chevron_right,
+                    color: oro.withValues(alpha: 0.8),
+                  ),
+                ],
+              ),
+            ),
           ),
         ),
       ),
@@ -323,186 +891,286 @@ Widget _buildAlineaciones() {
 
   final jugadores = jugadoresRaw.whereType<Map<String, dynamic>>().toList();
 
-  final jugadoresConIncidencia = jugadores.where((j) {
-    final g = j['goles'] ?? 0;
-    final a = j['tarjeta_amarilla'] ?? 0;
-    final r = j['tarjeta_roja'] ?? 0;
-    return (g is int && g > 0) || (a is int && a > 0) || (r is int && r > 0);
-  }).toList();
-
   final bajas = jugadores.where((j) => j['reemplazo_baja'] == true).toList();
   final disponibles = jugadores.where((j) => j['reemplazo_baja'] != true).toList();
 
-  final Map<String, List<Map<String, dynamic>>> porPosicion = {
-    'Arquero': [],
-    'Defensor': [],
-    'Mediocampista': [],
-    'Delantero': [],
-  };
+  final filas = _armarFilas(disponibles);
 
-  // 1. Agrupar normalmente
-  for (var j in disponibles) {
-    final pos = (j['posicion'] ?? '').toString();
-    if (porPosicion.containsKey(pos)) {
-      porPosicion[pos]?.add(j);
-    }
-  }
+  // A line holding a single player does not need the same slice of pitch as a
+  // full defence: giving it less weight reclaims the gap above the keeper.
+  final pesos = [for (final fila in filas) fila.length == 1 ? 2 : 3];
+  final pesoTotal = pesos.fold<int>(0, (total, peso) => total + peso);
 
-  // 2. Validar si hay al menos 1 arquero disponible
-  final arqueros = porPosicion['Arquero'] ?? [];
-  final hayArquero = arqueros.any((j) => j['reemplazo_baja'] != true);
-
-  if (!hayArquero) {
-    // 3. Buscar un suplente con "Arquero Sup."
-    final arqueroSup = disponibles.firstWhere(
-      (j) => j['posicion'] == 'Arquero Sup.',
-      orElse: () => {},
-    );
-
-    if (arqueroSup.isNotEmpty) {
-      porPosicion['Arquero']?.add(arqueroSup);
-    }
-  }
-
-  Widget wrapFila(List<Map<String, dynamic>> filaJugadores) {
-    return Wrap(
-      alignment: WrapAlignment.center,
-      spacing: 12,
-      runSpacing: 12,
-      children: filaJugadores.map((j) =>
-        GestureDetector(
-          onTap: () async {
-            showDialog(
-              context: context,
-              barrierDismissible: false,
-              builder: (context) => const Center(child: CircularProgressIndicator()),
-            );
-            try {
-              final jugadorCompleto = await ref.read(apiServiceProvider).getJugadorPorId(j['id']);
-              if (context.mounted) {
-                Navigator.of(context).pop(); // Quitar loader
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => PlayerDetailScreen(player: jugadorCompleto),
-                  ),
-                );
-              }
-            } catch (e) {
-              if (context.mounted) {
-                Navigator.of(context).pop();
-                showDialog(
-                  context: context,
-                  builder: (context) => AlertDialog(
-                    title: const Text('Error'),
-                    content: Text('No se pudo cargar la información del jugador.'),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.of(context).pop(),
-                        child: const Text('OK'),
-                      ),
-                    ],
-                  ),
-                );
-              }
-            }
-          },
-          child: AnimatedOpacity(
-            opacity: 1,
-            duration: const Duration(milliseconds: 500),
-            child: PlayerPod(jugador: j),
-          ),
-        )
-      ).toList(),
-    );
-  }
-
-  Widget wrapLineas(String key) {
-    final jugadores = porPosicion[key]!;
-    if (jugadores.isEmpty) return const SizedBox.shrink();
-
-    final filas = <List<Map<String, dynamic>>>[];
-    for (var i = 0; i < jugadores.length; i += 3) {
-      filas.add(jugadores.skip(i).take(3).toList());
-    }
-
-    return Column(children: filas.map(wrapFila).toList());
+  var acumulado = 0;
+  final profundidades = <double>[];
+  for (final peso in pesos) {
+    // Depth of the row's centre, measured with the real weights so the
+    // perspective clamp keeps matching where the row actually sits.
+    profundidades.add((acumulado + peso / 2) / pesoTotal);
+    acumulado += peso;
   }
 
   return Column(
     children: [
-      Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Flexible(
-            child: ChoiceChip(
-              label: Text(
-                widget.partido['equipo_local'],
-                overflow: TextOverflow.ellipsis,
-                maxLines: 1,
-              ),
-              selected: equipoSeleccionado == 'local',
-              onSelected: (_) => setState(() => equipoSeleccionado = 'local'),
-            ),
-          ),
-          const SizedBox(width: 8),
-          Flexible(
-            child: ChoiceChip(
-              label: Text(
-                widget.partido['equipo_visitante'],
-                overflow: TextOverflow.ellipsis,
-                maxLines: 1,
-              ),
-              selected: equipoSeleccionado == 'visitante',
-              onSelected: (_) => setState(() => equipoSeleccionado = 'visitante'),
-            ),
-          ),
-        ],
-      ),
+      _buildSelectorEquipo(),
       const SizedBox(height: 16),
-      Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: Colors.green[100],
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.green.shade800, width: 2),
-        ),
-        child: CustomPaint(
-          painter: FullFieldPainter(),
-          child: AnimatedSwitcher(
-            duration: const Duration(milliseconds: 400),
-            child: Column(
-              key: ValueKey(equipoSeleccionado),
+      ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: AspectRatio(
+          aspectRatio: 0.86,
+          child: LayoutBuilder(
+            builder: (context, constraints) => Stack(
+              fit: StackFit.expand,
               children: [
-                wrapLineas('Arquero'),
-                wrapLineas('Defensor'),
-                wrapLineas('Mediocampista'),
-                wrapLineas('Delantero'),
+                const CustomPaint(painter: FullFieldPainter()),
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 400),
+                  child: Padding(
+                    key: ValueKey(equipoSeleccionado),
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    child: Column(
+                      children: [
+                        for (var i = 0; i < filas.length; i++)
+                          _buildLineaJugadores(
+                            filas[i],
+                            peso: pesos[i],
+                            profundidad: profundidades[i],
+                            anchoCancha: constraints.maxWidth,
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
         ),
       ),
-      if (bajas.isNotEmpty)
-        Padding(
-          padding: const EdgeInsets.only(top: 16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Bajas:', style: TextStyle(fontWeight: FontWeight.bold)),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 12,
-                runSpacing: 12,
-                alignment: WrapAlignment.center,
-                children: bajas.map((j) => PlayerPod(jugador: j)).toList(),
-              ),
-            ],
-          ),
-        ),
+      if (bajas.isNotEmpty) _buildBajas(bajas),
     ],
   );
 }
+
+  /// Players unavailable for the match. Wrapped in the same panel language as
+  /// the rest of the detail so the list does not read as leftovers.
+  Widget _buildBajas(List<Map<String, dynamic>> bajas) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 20),
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: Colors.grey.shade200),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: double.infinity,
+              color: Colors.grey.shade50,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+              child: Row(
+                children: [
+                  Icon(Icons.person_off_outlined,
+                      size: 16, color: Colors.grey.shade600),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'BAJAS',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.8,
+                        color: Colors.grey.shade700,
+                      ),
+                    ),
+                  ),
+                  Text(
+                    bajas.length == 1 ? '1 jugador' : '${bajas.length} jugadores',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                  ),
+                ],
+              ),
+            ),
+            Divider(height: 1, color: Colors.grey.shade200),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
+              child: Wrap(
+                spacing: 14,
+                runSpacing: 18,
+                alignment: WrapAlignment.center,
+                children: bajas
+                    .map((j) => GestureDetector(
+                          onTap: () => _abrirDetalleJugador(j['id']),
+                          child: PlayerPod(jugador: j, scale: 0.85, onField: false),
+                        ))
+                    .toList(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Maximum players drawn on a single line before adding another one.
+  static const int _maxPorFila = 4;
+
+  /// Maximum number of outfield lines, so a large squad packs rows instead of
+  /// producing a column of nearly empty ones.
+  static const int _maxFilasCampo = 4;
+
+  /// Relative weight used to order players down the pitch. Positions are often
+  /// left at their default value in the backend, so this only drives the
+  /// ordering — the number of players per line comes from [_repartirEnFilas].
+  static const Map<String, int> _ordenPosicion = {
+    'Defensor': 0,
+    'Mediocampista': 1,
+    'Delantero': 2,
+  };
+
+  /// Builds the pitch rows, top to bottom: the keeper alone, then everyone
+  /// else spread over balanced lines ordered defence → midfield → attack.
+  ///
+  /// Players are never filtered out by position: an unrecognised or missing
+  /// position sorts with the midfield instead of disappearing from the pitch.
+  List<List<Map<String, dynamic>>> _armarFilas(List<Map<String, dynamic>> disponibles) {
+    final restantes = List<Map<String, dynamic>>.from(disponibles);
+
+    Map<String, dynamic>? arquero;
+    for (final posicion in ['Arquero', 'Arquero Sup.']) {
+      final indice = restantes.indexWhere((j) => j['posicion'] == posicion);
+      if (indice != -1) {
+        arquero = restantes.removeAt(indice);
+        break;
+      }
+    }
+
+    // Decorate with the original index so equal positions keep their incoming
+    // order — List.sort is not stable in Dart.
+    final indexados = restantes.asMap().entries.toList()
+      ..sort((a, b) {
+        final pa = _ordenPosicion[a.value['posicion']?.toString()] ?? 1;
+        final pb = _ordenPosicion[b.value['posicion']?.toString()] ?? 1;
+        return pa != pb ? pa.compareTo(pb) : a.key.compareTo(b.key);
+      });
+
+    return [
+      if (arquero != null) [arquero],
+      ..._repartirEnFilas(indexados.map((e) => e.value).toList()),
+    ];
+  }
+
+  /// Splits [jugadores] into balanced lines, preserving their order. Extra
+  /// players go to the first lines, keeping the defensive side the widest.
+  List<List<Map<String, dynamic>>> _repartirEnFilas(List<Map<String, dynamic>> jugadores) {
+    if (jugadores.isEmpty) return [];
+
+    final cantidadFilas =
+        (jugadores.length / _maxPorFila).ceil().clamp(1, _maxFilasCampo);
+    final base = jugadores.length ~/ cantidadFilas;
+    var resto = jugadores.length % cantidadFilas;
+
+    final filas = <List<Map<String, dynamic>>>[];
+    var desde = 0;
+    for (var i = 0; i < cantidadFilas; i++) {
+      final cantidad = base + (resto > 0 ? 1 : 0);
+      if (resto > 0) resto--;
+      filas.add(jugadores.sublist(desde, desde + cantidad));
+      desde += cantidad;
+    }
+    return filas;
+  }
+
+  /// One line of players on the pitch.
+  ///
+  /// The line is clamped to the pitch width at its own depth, using the same
+  /// perspective as [FullFieldPainter], so markers never spill past the
+  /// touchline. Crowded lines shrink as a block instead of overflowing.
+  Widget _buildLineaJugadores(
+    List<Map<String, dynamic>> jugadores, {
+    required int peso,
+    required double profundidad,
+    required double anchoCancha,
+  }) {
+    if (jugadores.isEmpty) return const SizedBox.shrink();
+
+    final escala = 0.78 + (1.0 - 0.78) * profundidad;
+    final anchoDisponible =
+        anchoCancha * FullFieldPainter.halfWidthAt(profundidad) * 2 * 0.94;
+
+    return Expanded(
+      flex: peso,
+      child: Center(
+        child: SizedBox(
+          width: anchoDisponible,
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: jugadores
+                  .map((j) => Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 2),
+                        child: GestureDetector(
+                          onTap: () => _abrirDetalleJugador(j['id']),
+                          child: PlayerPod(jugador: j, scale: escala),
+                        ),
+                      ))
+                  .toList(),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSelectorEquipo() {
+    final primary = Theme.of(context).colorScheme.primary;
+
+    Widget opcion(String valor, String nombre) {
+      final seleccionado = equipoSeleccionado == valor;
+      return Expanded(
+        child: GestureDetector(
+          onTap: () => setState(() => equipoSeleccionado = valor),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            padding: const EdgeInsets.symmetric(vertical: 7),
+            decoration: BoxDecoration(
+              color: seleccionado ? primary : Colors.transparent,
+              borderRadius: BorderRadius.circular(24),
+            ),
+            child: Text(
+              decodeHtmlEntities(nombre),
+              textAlign: TextAlign.center,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: seleccionado ? Colors.white : Colors.black54,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: Colors.grey.shade200,
+        borderRadius: BorderRadius.circular(24),
+      ),
+      child: Row(
+        children: [
+          opcion('local', widget.partido['equipo_local']?.toString() ?? 'Local'),
+          opcion('visitante', widget.partido['equipo_visitante']?.toString() ?? 'Visitante'),
+        ],
+      ),
+    );
+  }
 
   Widget _buildPendiente() {
     return Center(
@@ -541,21 +1209,15 @@ Widget _buildAlineaciones() {
             labelColor: Colors.black,
             indicatorColor: Theme.of(context).colorScheme.primary,
             tabs: const [
-              Tab(text: 'Resumen'),
               Tab(text: 'Estadísticas'),
               Tab(text: 'Alineaciones'),
+              Tab(text: 'Información'),
             ],
           ),
           Expanded(
             child: TabBarView(
               controller: _tabController,
               children: [
-                _esFuturo
-                    ? _buildPendiente()
-                    : SingleChildScrollView(
-                        padding: const EdgeInsets.all(16),
-                        child: _buildResumen(),
-                      ),
                 _esFuturo
                     ? _buildPendiente()
                     : goleadores == null && isLoading
@@ -577,6 +1239,12 @@ Widget _buildAlineaciones() {
                             padding: const EdgeInsets.all(16),
                             child: _buildAlineaciones(),
                           ),
+                _esFuturo
+                    ? _buildPendiente()
+                    : SingleChildScrollView(
+                        padding: const EdgeInsets.all(16),
+                        child: _buildInformacion(),
+                      ),
               ],
             ),
           ),

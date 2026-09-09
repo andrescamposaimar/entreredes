@@ -360,7 +360,14 @@ if ( ! function_exists( 'wp_generate_password' ) ) {
 // ─── WP hook shims (no-ops) ───────────────────────────────────────────────────
 
 if ( ! function_exists( 'add_action' ) ) {
+    /**
+     * Records the callback (unlike a pure no-op) so tests can invoke deferred
+     * hooks — e.g. admin_notices closures registered by InitialSchema /
+     * MigrationRunner — the same way WordPress would when rendering wp-admin.
+     * do_action() below fires them; did_action()'s counter is unaffected.
+     */
     function add_action( string $tag, callable $fn, int $priority = 10, int $accepted_args = 1 ): true {
+        $GLOBALS['_prode_test_action_callbacks'][ $tag ][] = $fn;
         return true;
     }
 }
@@ -370,6 +377,9 @@ if ( ! function_exists( 'do_action' ) ) {
 
     function do_action( string $tag, mixed ...$args ): void {
         $GLOBALS['_prode_test_actions'][ $tag ] = ( $GLOBALS['_prode_test_actions'][ $tag ] ?? 0 ) + 1;
+        foreach ( $GLOBALS['_prode_test_action_callbacks'][ $tag ] ?? [] as $fn ) {
+            $fn( ...$args );
+        }
     }
 }
 
@@ -471,6 +481,7 @@ if ( ! class_exists( 'WP_REST_Request' ) ) {
         private array $headers = [];
         /** @var array<string, mixed> */
         private array $params = [];
+        private string $route = '';
 
         public function set_header( string $name, string $value ): void {
             $this->headers[ strtolower( $name ) ] = $value;
@@ -486,6 +497,14 @@ if ( ! class_exists( 'WP_REST_Request' ) ) {
 
         public function get_param( string $name ): mixed {
             return $this->params[ $name ] ?? null;
+        }
+
+        public function set_route( string $route ): void {
+            $this->route = $route;
+        }
+
+        public function get_route(): string {
+            return $this->route;
         }
     }
 }
@@ -532,6 +551,8 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
     class WP_REST_Response {
         private mixed $data;
         private int $status;
+        /** @var array<string, string> */
+        private array $headers = [];
 
         public function __construct( mixed $data = null, int $status = 200 ) {
             $this->data   = $data;
@@ -544,6 +565,23 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
 
         public function get_status(): int {
             return $this->status;
+        }
+
+        /**
+         * Mirrors WP_HTTP_Response::header(): $replace = false concatenates
+         * onto the existing value with ', ' instead of overwriting it.
+         */
+        public function header( string $key, string $value, bool $replace = true ): void {
+            if ( $replace || ! isset( $this->headers[ $key ] ) ) {
+                $this->headers[ $key ] = $value;
+            } else {
+                $this->headers[ $key ] .= ', ' . $value;
+            }
+        }
+
+        /** @return array<string, string> */
+        public function get_headers(): array {
+            return $this->headers;
         }
     }
 }
@@ -640,10 +678,167 @@ if ( ! function_exists( 'add_query_arg' ) ) {
     }
 }
 
+// ─── SportsPress / WP post-meta stubs ─────────────────────────────────────────
+// These are no-ops in test context. The WpRosterResolver is tested indirectly
+// through the RosterResolverInterface seam (fake resolver injected in tests).
+
+if ( ! function_exists( 'get_the_post_thumbnail_url' ) ) {
+    function get_the_post_thumbnail_url( int|string $post = 0, mixed $size = 'post-thumbnail' ): string|false {
+        return false;
+    }
+}
+
+if ( ! function_exists( 'get_post_meta' ) ) {
+    function get_post_meta( int $post_id, string $key = '', bool $single = false ): mixed {
+        // Data-driven so tests can reproduce real postmeta shapes — notably the
+        // multi-row sp_current_team that WpRosterResolver has to survive. Empty
+        // globals reproduce the previous stub exactly.
+        global $wp_test_postmeta;
+        $rows = $wp_test_postmeta[ $post_id ][ $key ] ?? [];
+
+        return $single ? ( $rows[0] ?? '' ) : $rows;
+    }
+}
+
+if ( ! function_exists( 'get_the_title' ) ) {
+    function get_the_title( int|string $post = 0 ): string {
+        global $wp_test_post_titles;
+
+        return (string) ( $wp_test_post_titles[ (int) $post ] ?? '' );
+    }
+}
+
 // ─── Misc WP functions ────────────────────────────────────────────────────────
 
 if ( ! function_exists( 'version_compare' ) ) {
     // PHP built-in; never needed. Here only for clarity.
+}
+
+// ─── WP_List_Table stub ───────────────────────────────────────────────────────
+// Minimal stub so subclasses (PredictionsListTable, AuditLogListTable, etc.)
+// can be loaded and their non-rendering methods tested headlessly.
+
+if ( ! class_exists( 'WP_List_Table' ) ) {
+    class WP_List_Table {
+        /** @var array<string, mixed> */
+        protected array $_column_headers = [];
+        /** @var array<int, mixed> */
+        public array $items = [];
+
+        /** @param array<string, mixed> $args */
+        public function __construct( array $args = [] ) {}
+
+        /** @param array<string, mixed> $args */
+        protected function set_pagination_args( array $args ): void {}
+
+        public function prepare_items(): void {}
+
+        public function display(): void {}
+
+        public function no_items(): void {}
+
+        /** @return array<string, string> */
+        public function get_columns(): array {
+            return [];
+        }
+    }
+}
+
+// ─── WP admin URL shim ───────────────────────────────────────────────────────
+
+if ( ! function_exists( 'admin_url' ) ) {
+    function admin_url( string $path = '' ): string {
+        return 'http://example.com/wp-admin/' . ltrim( $path, '/' );
+    }
+}
+
+if ( ! function_exists( 'get_admin_page_title' ) ) {
+    function get_admin_page_title(): string {
+        return 'Admin Page';
+    }
+}
+
+if ( ! function_exists( 'current_user_can' ) ) {
+    function current_user_can( string $capability ): bool {
+        return false;
+    }
+}
+
+if ( ! function_exists( 'wp_die' ) ) {
+    function wp_die( string $message = '', string $title = '', mixed $args = [] ): void {
+        throw new \RuntimeException( $message );
+    }
+}
+
+if ( ! function_exists( 'selected' ) ) {
+    function selected( mixed $selected, mixed $current = true, bool $echo = true ): string {
+        $result = ( (string) $selected === (string) $current ) ? ' selected="selected"' : '';
+        if ( $echo ) {
+            echo $result;
+        }
+        return $result;
+    }
+}
+
+if ( ! function_exists( 'submit_button' ) ) {
+    function submit_button( string $text = '', string $type = 'primary', string $name = 'submit', bool $wrap = true, mixed $other_attributes = null ): void {
+        echo '<input type="submit" name="' . $name . '" value="' . $text . '">';
+    }
+}
+
+if ( ! function_exists( 'wp_safe_redirect' ) ) {
+    function wp_safe_redirect( string $location, int $status = 302 ): bool {
+        return true;
+    }
+}
+
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', '/tmp/wp/' );
+}
+
+// ─── WP admin menu / hook stubs ───────────────────────────────────────────────
+
+if ( ! function_exists( 'is_admin' ) ) {
+    function is_admin(): bool {
+        return false;
+    }
+}
+
+if ( ! function_exists( 'wp_next_scheduled' ) ) {
+    // Return a future timestamp so Plugin::boot() does NOT call scheduleCrons(),
+    // which would require wp_schedule_event() and other cron functions not
+    // needed for admin wiring tests.
+    function wp_next_scheduled( string $hook, array $args = [] ): int|false {
+        return time() + 3600;
+    }
+}
+
+if ( ! function_exists( 'load_plugin_textdomain' ) ) {
+    function load_plugin_textdomain( string $domain, mixed $deprecated = false, mixed $plugin_rel_path = false ): bool {
+        return true;
+    }
+}
+
+if ( ! function_exists( 'plugin_basename' ) ) {
+    function plugin_basename( string $file ): string {
+        return basename( $file );
+    }
+}
+
+if ( ! defined( 'WP_CLI' ) ) {
+    define( 'WP_CLI', false );
+}
+
+if ( ! function_exists( 'add_menu_page' ) ) {
+    function add_menu_page( string $page_title, string $menu_title, string $capability, string $menu_slug, mixed $function = null, string $icon_url = '', ?int $position = null ): string {
+        return $menu_slug;
+    }
+}
+
+if ( ! function_exists( 'add_submenu_page' ) ) {
+    function add_submenu_page( string $parent_slug, string $page_title, string $menu_title, string $capability, string $menu_slug, mixed $function = null, ?int $position = null ): string|false {
+        return $menu_slug;
+    }
 }
 
 // phpcs:enable

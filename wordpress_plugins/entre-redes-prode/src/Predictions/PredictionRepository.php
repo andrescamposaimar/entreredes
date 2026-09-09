@@ -63,6 +63,9 @@ class PredictionRepository {
      * @param int    $scoreHome        Predicted home score [0, 255].
      * @param int    $scoreAway        Predicted away score [0, 255].
      * @param string $lockedAtSnapshot The prode_fechas.locked_at value snapshotted at write time.
+     * @return bool True when a new row was INSERTed; false when an existing row was UPDATEd.
+     *              Callers (e.g. PredictionController) use this to log whether a
+     *              submission was a first-time prediction or a change to one.
      */
     public function upsert(
         int $userId,
@@ -71,7 +74,7 @@ class PredictionRepository {
         int $scoreHome,
         int $scoreAway,
         string $lockedAtSnapshot
-    ): void {
+    ): bool {
         $wpdb   = $this->wpdb;
         $p      = $wpdb->prefix;
         $result = $this->deriveResult( $scoreHome, $scoreAway );
@@ -108,9 +111,31 @@ class PredictionRepository {
             );
         } else {
             // Step 2b: row exists — UPDATE (created_at intentionally excluded).
+            //
+            // fecha_id IS updated here (unlike created_at): the UNIQUE key on
+            // this table is (user_id, match_id) only, while prode_fecha_matches'
+            // UNIQUE is (fecha_id, match_id) — the schema permits the SAME
+            // match_id to belong to two different fechas over time (e.g. a
+            // postponed match re-seeded into a later fecha). Before this fix,
+            // a prediction re-submitted for that match under the NEW fecha
+            // silently stayed attributed to the OLD fecha_id here, making it
+            // invisible to findByUserAndFecha() and FechaEvaluator (both
+            // filter by fecha_id) — the user's new prediction, and its points,
+            // vanished.
+            //
+            // Trade-off: because the row's identity is still (user_id,
+            // match_id), only ONE fecha can "own" a user's prediction for a
+            // given match_id at a time — the row always reflects whichever
+            // fecha it was LAST written under. If the same match_id were ever
+            // concurrently active in two open fechas, the row would follow
+            // whichever upsert happened last rather than existing under both.
+            // That scenario has not occurred in production; fixing it would
+            // require changing the UNIQUE key to (user_id, fecha_id, match_id),
+            // which is a schema change out of scope here.
             $wpdb->update(
                 $p . 'prode_predictions',
                 [
+                    'fecha_id'           => $fechaId,
                     'result'             => $result,
                     'score_home'         => $scoreHome,
                     'score_away'         => $scoreAway,
@@ -122,6 +147,8 @@ class PredictionRepository {
         }
 
         $wpdb->query( 'COMMIT' );
+
+        return null === $existingId;
     }
 
     /**
@@ -190,14 +217,278 @@ class PredictionRepository {
     }
 
     /**
-     * Return all predictions submitted by a user for a given fecha.
+     * Aggregate popular percentages for a single match.
      *
-     * Used by FechaController to back-populate user_predictions in the GET
-     * /prode/fecha-activa response (WU-A2).
+     * Counterpart of aggregatePopulares(), which works per fecha. The match
+     * detail screen knows a match id but not which fecha holds it, so this
+     * reads by match and reports back whether any fecha containing it is still
+     * open.
+     *
+     * Semantics:
+     *   - Percentages are rounded to 1 decimal place.
+     *   - All three result keys ('1', 'X', '2') are always present.
+     *   - A match with no predictions returns total 0 and all keys at 0.0.
+     *   - `open` is true when at least one fecha holding this match is still
+     *     accepting predictions.
+     *
+     * Gate: the caller decides what to do with `open` — this method always runs
+     * the query. Mirrors the contract of aggregatePopulares().
+     *
+     * @param int $matchId The sp_event id predictions were stored against.
+     * @return array{total: int, open: bool, populares: array{'1': float, 'X': float, '2': float}}
+     */
+    public function aggregateForMatch( int $matchId ): array {
+        $wpdb = $this->wpdb;
+        $p    = $wpdb->prefix;
+
+        $rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT p.result AS result, COUNT(*) AS cnt, f.state AS state
+                   FROM {$p}prode_predictions p
+                   INNER JOIN {$p}prode_fechas f ON f.id = p.fecha_id
+                  WHERE p.match_id = %d
+                  GROUP BY p.result, f.state",
+                $matchId
+            ),
+            ARRAY_A
+        );
+
+        $counts = [ '1' => 0, 'X' => 0, '2' => 0 ];
+        $total  = 0;
+        $open   = false;
+
+        foreach ( (array) $rows as $row ) {
+            $result = (string) ( $row['result'] ?? '' );
+            $cnt    = (int) ( $row['cnt'] ?? 0 );
+
+            if ( ! array_key_exists( $result, $counts ) ) {
+                continue;
+            }
+
+            $counts[ $result ] += $cnt;
+            $total             += $cnt;
+
+            if ( 'open' === (string) ( $row['state'] ?? '' ) ) {
+                $open = true;
+            }
+        }
+
+        if ( 0 === $total ) {
+            return [
+                'total'     => 0,
+                'open'      => $open,
+                'populares' => [ '1' => 0.0, 'X' => 0.0, '2' => 0.0 ],
+            ];
+        }
+
+        return [
+            'total'     => $total,
+            'open'      => $open,
+            'populares' => [
+                '1' => round( ( $counts['1'] / $total ) * 100, 1 ),
+                'X' => round( ( $counts['X'] / $total ) * 100, 1 ),
+                '2' => round( ( $counts['2'] / $total ) * 100, 1 ),
+            ],
+        ];
+    }
+
+    /**
+     * Return all predictions across all fechas for a given user, joined with
+     * match metadata and evaluation results.
+     *
+     * Used by the admin Predictions page (capability B — PR-3).
+     *
+     * JOIN strategy:
+     *   - LEFT JOIN prode_fecha_matches on (fecha_id + match_id) for home_team,
+     *     away_team, real_score_home/away, is_final.
+     *   - LEFT JOIN prode_scores on (user_id + match_id) for points and
+     *     evaluation_method.
+     *
+     * No wp_users JOIN (design constraint).
+     * ORDER BY fecha_id ASC, match_id ASC (spec: per-user detail sort order).
+     *
+     * @param int $userId The prode_users.id to query.
+     * @return array<int, array<string, mixed>>
+     */
+    public function findAllByUser( int $userId ): array {
+        $wpdb = $this->wpdb;
+        $p    = $wpdb->prefix;
+
+        $rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT p.fecha_id,
+                        p.match_id,
+                        fm.home_team,
+                        fm.away_team,
+                        p.score_home,
+                        p.score_away,
+                        fm.real_score_home,
+                        fm.real_score_away,
+                        fm.is_final,
+                        s.points,
+                        s.evaluation_method
+                   FROM {$p}prode_predictions p
+                   LEFT JOIN {$p}prode_fecha_matches fm
+                          ON fm.fecha_id = p.fecha_id
+                         AND fm.match_id = p.match_id
+                   LEFT JOIN {$p}prode_scores s
+                          ON s.user_id = p.user_id
+                         AND s.match_id = p.match_id
+                  WHERE p.user_id = %d
+                  ORDER BY p.fecha_id ASC, p.match_id ASC",
+                $userId
+            ),
+            ARRAY_A
+        );
+
+        return $rows ?: [];
+    }
+
+    /**
+     * Return the total number of predictions for a given user across all fechas.
+     *
+     * Used for pagination in the admin Predictions page (capability B — PR-3).
+     *
+     * @param int $userId The prode_users.id to count.
+     * @return int
+     */
+    public function countByUser( int $userId ): int {
+        $wpdb = $this->wpdb;
+        $p    = $wpdb->prefix;
+
+        $count = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$p}prode_predictions WHERE user_id = %d",
+                $userId
+            )
+        );
+
+        return (int) $count;
+    }
+
+    /**
+     * Return a paginated slice of a user's predictions for FINISHED matches,
+     * ordered most-recent-first, joined with match snapshot metadata and
+     * evaluation results.
+     *
+     * "Finished" means the match has a final result recorded
+     * (prode_fecha_matches.is_final = 1). This powers the app's "Anteriores"
+     * (past predictions) infinite-scroll list. Upcoming/open matches are served
+     * by the per-fecha fixtures endpoints, not here.
+     *
+     * JOIN strategy:
+     *   - LEFT JOIN prode_fecha_matches for the snapshot (kickoff, teams, zona,
+     *     escudos, real scores, is_final). The is_final = 1 filter in WHERE makes
+     *     this effectively an inner join — predictions without a final match row
+     *     are excluded.
+     *   - JOIN prode_fechas for season_id (used by the client to render the
+     *     "{season} - {zona}" header line).
+     *   - LEFT JOIN prode_scores for points + evaluation_method (null when the
+     *     fecha is final but not yet evaluated).
+     *
+     * Ordering: match_kickoff DESC, match_id DESC (most recent first; match_id is
+     * a stable tiebreak for matches sharing a kickoff time).
+     *
+     * No wp_users JOIN. No window functions. SQLite-shim compatible.
+     *
+     * @param int $userId The prode_users.id to query.
+     * @param int $limit  Page size (LIMIT).
+     * @param int $offset Row offset (OFFSET).
+     * @return array<int, array<string, mixed>>
+     */
+    public function findFinishedByUserPaginated( int $userId, int $limit, int $offset ): array {
+        $wpdb = $this->wpdb;
+        $p    = $wpdb->prefix;
+
+        $rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT p.fecha_id,
+                        p.match_id,
+                        f.season_id,
+                        fm.match_kickoff,
+                        fm.home_team,
+                        fm.away_team,
+                        fm.zona,
+                        fm.home_escudo,
+                        fm.away_escudo,
+                        p.score_home,
+                        p.score_away,
+                        fm.real_score_home,
+                        fm.real_score_away,
+                        fm.is_final,
+                        s.points,
+                        s.evaluation_method
+                   FROM {$p}prode_predictions p
+                   LEFT JOIN {$p}prode_fecha_matches fm
+                          ON fm.fecha_id = p.fecha_id
+                         AND fm.match_id = p.match_id
+                   LEFT JOIN {$p}prode_fechas f
+                          ON f.id = p.fecha_id
+                   LEFT JOIN {$p}prode_scores s
+                          ON s.user_id = p.user_id
+                         AND s.match_id = p.match_id
+                  WHERE p.user_id = %d
+                    AND fm.is_final = 1
+                  ORDER BY fm.match_kickoff DESC, fm.match_id DESC
+                  LIMIT %d OFFSET %d",
+                $userId,
+                $limit,
+                $offset
+            ),
+            ARRAY_A
+        );
+
+        return $rows ?: [];
+    }
+
+    /**
+     * Count a user's predictions for FINISHED matches (is_final = 1).
+     *
+     * Used for pagination of the "Anteriores" history list. Mirrors the WHERE
+     * clause of findFinishedByUserPaginated so totals and pages stay consistent.
+     *
+     * @param int $userId The prode_users.id to count.
+     * @return int
+     */
+    public function countFinishedByUser( int $userId ): int {
+        $wpdb = $this->wpdb;
+        $p    = $wpdb->prefix;
+
+        $count = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*)
+                   FROM {$p}prode_predictions p
+                   LEFT JOIN {$p}prode_fecha_matches fm
+                          ON fm.fecha_id = p.fecha_id
+                         AND fm.match_id = p.match_id
+                  WHERE p.user_id = %d
+                    AND fm.is_final = 1",
+                $userId
+            )
+        );
+
+        return (int) $count;
+    }
+
+    /**
+     * Return all predictions submitted by a user for a given fecha, with
+     * points and evaluation_method from prode_scores when available.
+     *
+     * Extends the previous SELECT with a LEFT JOIN on prode_scores so that
+     * evaluated predictions carry `points` (int|null) and `evaluation_method`
+     * (string|null). Rows without a matching prode_scores entry return null
+     * for both columns (pre-evaluation or never-evaluated predictions).
+     *
+     * Design constraints:
+     *   - LEFT JOIN on s.user_id + s.match_id (no window functions — SQLite shim compatible).
+     *   - No wp_users JOIN.
+     *   - The ON clause joins on column references (s.user_id = p.user_id AND
+     *     s.match_id = p.match_id), not a literal user_id bind, so a user's score
+     *     rows match their own predictions only. user_id is filtered once in WHERE.
      *
      * @param int $fechaId The prode_fechas.id to filter by.
      * @param int $userId  The prode_users.id whose predictions to return.
-     * @return array<int, array{match_id: int, score_home: int, score_away: int}>
+     * @return array<int, array{match_id: int, score_home: int, score_away: int, points: int|null, evaluation_method: string|null}>
      */
     public function findByUserAndFecha( int $fechaId, int $userId ): array {
         $wpdb = $this->wpdb;
@@ -205,9 +496,13 @@ class PredictionRepository {
 
         $rows = $wpdb->get_results(
             $wpdb->prepare(
-                "SELECT match_id, score_home, score_away
-                   FROM {$p}prode_predictions
-                  WHERE fecha_id = %d AND user_id = %d",
+                "SELECT p.match_id, p.score_home, p.score_away,
+                        s.points, s.evaluation_method
+                   FROM {$p}prode_predictions p
+                   LEFT JOIN {$p}prode_scores s
+                          ON s.user_id = p.user_id
+                         AND s.match_id = p.match_id
+                  WHERE p.fecha_id = %d AND p.user_id = %d",
                 $fechaId,
                 $userId
             ),

@@ -355,27 +355,29 @@ void main() {
       expect(match.homeEscudo, isNull);
     });
 
-    test('populares parsed — keys 1, X, 2 → home/draw/away doubles', () {
+    test('populares parsed — keys 1, X, 2 → home/draw/away doubles (percentage contract)', () {
+      // Backend sends percentages: 50.0 = 50%, 30.0 = 30%, 20.0 = 20%
       final match = FechaMatch.fromJson(
         _matchJsonG6d(
           includePopulares: true,
-          populares: {'1': 0.5, 'X': 0.3, '2': 0.2},
+          populares: {'1': 50.0, 'X': 30.0, '2': 20.0},
         ),
       );
       expect(match.populares, isNotNull);
-      expect(match.populares!.home, closeTo(0.5, 0.001));
-      expect(match.populares!.draw, closeTo(0.3, 0.001));
-      expect(match.populares!.away, closeTo(0.2, 0.001));
+      expect(match.populares!.home, closeTo(50.0, 0.001));
+      expect(match.populares!.draw, closeTo(30.0, 0.001));
+      expect(match.populares!.away, closeTo(20.0, 0.001));
     });
 
-    test('populares as int values → parsed as doubles', () {
+    test('populares as int values → parsed as doubles (zero-vote outcomes)', () {
+      // Backend may return integers when there are zero votes for an outcome
       final match = FechaMatch.fromJson(
         _matchJsonG6d(
           includePopulares: true,
-          populares: {'1': 1, 'X': 0, '2': 0},
+          populares: {'1': 100, 'X': 0, '2': 0},
         ),
       );
-      expect(match.populares!.home, equals(1.0));
+      expect(match.populares!.home, equals(100.0));
     });
 
     test('populares null value → populares is null', () {
@@ -403,19 +405,317 @@ void main() {
 
   // -------------------------------------------------------------------------
   // G6-d: Populares model
+  // Backend sends percentage values [0.0, 100.0] — e.g. 60.0 means 60%, not 0.6.
   // -------------------------------------------------------------------------
   group('Populares', () {
-    test('fromJson parses keys 1, X, 2 correctly', () {
-      final p = Populares.fromJson({'1': 0.6, 'X': 0.25, '2': 0.15});
-      expect(p.home, closeTo(0.6, 0.001));
-      expect(p.draw, closeTo(0.25, 0.001));
-      expect(p.away, closeTo(0.15, 0.001));
+    test('fromJson parses percentage keys 1, X, 2 correctly', () {
+      // Backend sends percentage values: 60.0 = 60%, 25.0 = 25%, 15.0 = 15%
+      final p = Populares.fromJson({'1': 60.0, 'X': 25.0, '2': 15.0});
+      expect(p.home, closeTo(60.0, 0.001));
+      expect(p.draw, closeTo(25.0, 0.001));
+      expect(p.away, closeTo(15.0, 0.001));
     });
 
     test('fromJson converts int values to double', () {
-      final p = Populares.fromJson({'1': 1, 'X': 0, '2': 0});
+      // Backend may send integers for 0-vote outcomes
+      final p = Populares.fromJson({'1': 100, 'X': 0, '2': 0});
       expect(p.home, isA<double>());
-      expect(p.home, equals(1.0));
+      expect(p.home, equals(100.0));
+    });
+
+    test('fromJson parses 100.0/0.0/0.0 (all votes on home) correctly', () {
+      final p = Populares.fromJson({'1': 100.0, 'X': 0.0, '2': 0.0});
+      expect(p.home, equals(100.0));
+      expect(p.draw, equals(0.0));
+      expect(p.away, equals(0.0));
+    });
+
+    test('fromJson parses realistic decimal percentages (e.g. 33.3)', () {
+      final p = Populares.fromJson({'1': 33.3, 'X': 33.3, '2': 33.4});
+      expect(p.home, closeTo(33.3, 0.001));
+      expect(p.draw, closeTo(33.3, 0.001));
+      expect(p.away, closeTo(33.4, 0.001));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // T-09: FechaMatch — realScoreHome, realScoreAway, isFinal fields
+  // -------------------------------------------------------------------------
+  group('FechaMatch real-score fields (T-09)', () {
+    Map<String, dynamic> _baseMatchJson({
+      int matchId = 1,
+      int? realScoreHome,
+      int? realScoreAway,
+      bool? isFinal,
+      bool omitRealScoreHome = false,
+      bool omitRealScoreAway = false,
+      bool omitIsFinal = false,
+    }) {
+      final json = <String, dynamic>{
+        'match_id': matchId,
+        'home_team': 'River',
+        'away_team': 'Boca',
+        'kickoff': '2026-06-06 13:45:00',
+      };
+      if (!omitRealScoreHome) json['real_score_home'] = realScoreHome;
+      if (!omitRealScoreAway) json['real_score_away'] = realScoreAway;
+      if (!omitIsFinal) json['is_final'] = isFinal ?? false;
+      return json;
+    }
+
+    test('isFinal defaults to false when key is absent', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(omitIsFinal: true));
+      expect(match.isFinal, isFalse);
+    });
+
+    test('isFinal=true parsed correctly', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(isFinal: true));
+      expect(match.isFinal, isTrue);
+    });
+
+    test('isFinal=false parsed correctly', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(isFinal: false));
+      expect(match.isFinal, isFalse);
+    });
+
+    test('realScoreHome parsed when present and non-null', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(realScoreHome: 2, isFinal: true));
+      expect(match.realScoreHome, equals(2));
+    });
+
+    test('realScoreAway parsed when present and non-null', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(realScoreAway: 1, isFinal: true));
+      expect(match.realScoreAway, equals(1));
+    });
+
+    test('realScoreHome null value → null (active/locked fecha)', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(realScoreHome: null));
+      expect(match.realScoreHome, isNull);
+    });
+
+    test('realScoreAway null value → null (active/locked fecha)', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(realScoreAway: null));
+      expect(match.realScoreAway, isNull);
+    });
+
+    test('realScoreHome absent → null (backward compat — pre-change payload)', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(omitRealScoreHome: true));
+      expect(match.realScoreHome, isNull);
+    });
+
+    test('realScoreAway absent → null (backward compat — pre-change payload)', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(omitRealScoreAway: true));
+      expect(match.realScoreAway, isNull);
+    });
+
+    test('realScoreHome 0 parsed as 0 (not null)', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(realScoreHome: 0, isFinal: true));
+      expect(match.realScoreHome, equals(0));
+    });
+
+    test('full evaluated match: all real-score fields present and populated', () {
+      final match = FechaMatch.fromJson(_baseMatchJson(
+        realScoreHome: 3,
+        realScoreAway: 1,
+        isFinal: true,
+      ));
+      expect(match.realScoreHome, equals(3));
+      expect(match.realScoreAway, equals(1));
+      expect(match.isFinal, isTrue);
+    });
+
+    test('legacy evaluated match: isFinal absent, real scores null — no crash', () {
+      // Pre-change payload: was evaluated before this feature, lacks is_final and real scores
+      final match = FechaMatch.fromJson({
+        'match_id': 1,
+        'home_team': 'A',
+        'away_team': 'B',
+        'kickoff': '2026-06-06 13:45:00',
+      });
+      expect(match.isFinal, isFalse);
+      expect(match.realScoreHome, isNull);
+      expect(match.realScoreAway, isNull);
+    });
+
+    test('== considers realScoreHome, realScoreAway, isFinal', () {
+      final a = FechaMatch.fromJson(_baseMatchJson(realScoreHome: 2, realScoreAway: 1, isFinal: true));
+      final b = FechaMatch.fromJson(_baseMatchJson(realScoreHome: 2, realScoreAway: 1, isFinal: true));
+      final c = FechaMatch.fromJson(_baseMatchJson(realScoreHome: 0, realScoreAway: 0, isFinal: false));
+      expect(a, equals(b));
+      expect(a, isNot(equals(c)));
+    });
+
+    test('hashCode equal for same real-score data', () {
+      final a = FechaMatch.fromJson(_baseMatchJson(realScoreHome: 2, realScoreAway: 1, isFinal: true));
+      final b = FechaMatch.fromJson(_baseMatchJson(realScoreHome: 2, realScoreAway: 1, isFinal: true));
+      expect(a.hashCode, equals(b.hashCode));
+    });
+
+    test('existing fields (zona, escudo, populares) unaffected by T-09 additions', () {
+      final match = FechaMatch.fromJson({
+        'match_id': 7,
+        'home_team': 'River',
+        'away_team': 'Boca',
+        'kickoff': '2026-06-06 13:45:00',
+        'zona': 'Zona A',
+        'home_escudo': 'https://cdn.test/r.png',
+        'away_escudo': 'https://cdn.test/b.png',
+        // Backend sends percentages: 50.0 = 50%, 30.0 = 30%, 20.0 = 20%
+        'populares': {'1': 50.0, 'X': 30.0, '2': 20.0},
+        'real_score_home': 2,
+        'real_score_away': 1,
+        'is_final': true,
+      });
+      expect(match.matchId, equals(7));
+      expect(match.zona, equals('Zona A'));
+      expect(match.populares, isNotNull);
+      expect(match.realScoreHome, equals(2));
+      expect(match.isFinal, isTrue);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // T-10: PredictionEntry — points, evaluationMethod fields
+  // -------------------------------------------------------------------------
+  group('PredictionEntry result fields (T-10)', () {
+    test('points parsed when present and non-null', () {
+      final entry = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+        'points': 3,
+      });
+      expect(entry.points, equals(3));
+    });
+
+    test('evaluationMethod parsed when present and non-null', () {
+      final entry = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+        'evaluation_method': 'exact_score',
+      });
+      expect(entry.evaluationMethod, equals('exact_score'));
+    });
+
+    test('points null → null (active/locked fecha, not yet evaluated)', () {
+      final entry = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+        'points': null,
+      });
+      expect(entry.points, isNull);
+    });
+
+    test('evaluationMethod null → null', () {
+      final entry = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+        'evaluation_method': null,
+      });
+      expect(entry.evaluationMethod, isNull);
+    });
+
+    test('points absent → null (backward compat — pre-change payload)', () {
+      final entry = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+      });
+      expect(entry.points, isNull);
+    });
+
+    test('evaluationMethod absent → null (backward compat)', () {
+      final entry = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+      });
+      expect(entry.evaluationMethod, isNull);
+    });
+
+    test('points=0 parsed as 0 (wrong prediction, not null)', () {
+      final entry = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+        'points': 0,
+        'evaluation_method': 'result_only',
+      });
+      expect(entry.points, equals(0));
+      expect(entry.evaluationMethod, equals('result_only'));
+    });
+
+    test('all evaluation_method values parsed correctly', () {
+      for (final method in ['exact_score', 'result_only', 'no_prediction', 'no_match_score']) {
+        final entry = PredictionEntry.fromJson({
+          'match_id': 1,
+          'score_home': 0,
+          'score_away': 0,
+          'points': 0,
+          'evaluation_method': method,
+        });
+        expect(entry.evaluationMethod, equals(method));
+      }
+    });
+
+    test('== considers points and evaluationMethod', () {
+      final a = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+        'points': 3,
+        'evaluation_method': 'exact_score',
+      });
+      final b = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+        'points': 3,
+        'evaluation_method': 'exact_score',
+      });
+      final c = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+        'points': 1,
+        'evaluation_method': 'result_only',
+      });
+      expect(a, equals(b));
+      expect(a, isNot(equals(c)));
+    });
+
+    test('hashCode equal for identical data', () {
+      final a = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+        'points': 3,
+        'evaluation_method': 'exact_score',
+      });
+      final b = PredictionEntry.fromJson({
+        'match_id': 5,
+        'score_home': 2,
+        'score_away': 1,
+        'points': 3,
+        'evaluation_method': 'exact_score',
+      });
+      expect(a.hashCode, equals(b.hashCode));
+    });
+
+    test('existing fields unaffected — matchId, scoreHome, scoreAway still parsed', () {
+      final entry = PredictionEntry.fromJson({
+        'match_id': 7,
+        'score_home': 3,
+        'score_away': 2,
+        'points': 1,
+        'evaluation_method': 'result_only',
+      });
+      expect(entry.matchId, equals(7));
+      expect(entry.scoreHome, equals(3));
+      expect(entry.scoreAway, equals(2));
     });
   });
 }

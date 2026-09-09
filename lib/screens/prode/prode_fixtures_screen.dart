@@ -4,8 +4,16 @@ import 'package:intl/intl.dart';
 
 import '../../models/fecha_activa.dart';
 import '../../models/fecha_summary.dart';
+import '../../models/prediction_history.dart';
+import '../../models/prode_ranking.dart';
 import '../../providers/prode_providers.dart';
+import '../../services/prode_api_service.dart';
 import '../../services/prode_fixtures_controller.dart';
+import '../../services/prode_history_controller.dart';
+import '../../services/prode_ranking_controller.dart';
+import '../../widgets/prode_segmented_toggle.dart';
+import 'prediction_result_style.dart';
+import 'prode_ranking_screen.dart';
 
 /// Container for the Prode Fixtures screen.
 ///
@@ -17,16 +25,13 @@ import '../../services/prode_fixtures_controller.dart';
 /// on [ProdeFixturesLoading] so re-entry while already Loaded/Empty/Error
 /// does NOT clobber the existing state.
 ///
-/// [stale] and [onLogout] are forwarded from the [ProdeAuthAuthenticated]
-/// arm in [ProdeAuthView] so the stale banner and logout affordance remain
-/// accessible from within the fixtures screen.
+/// [onLogout] is forwarded from [ProdeChamiScreen] so the logout affordance
+/// remains accessible from within the fixtures screen.
 class ProdeFixturesScreen extends ConsumerStatefulWidget {
-  final bool stale;
   final VoidCallback onLogout;
 
   const ProdeFixturesScreen({
     super.key,
-    required this.stale,
     required this.onLogout,
   });
 
@@ -57,7 +62,6 @@ class _ProdeFixturesScreenState extends ConsumerState<ProdeFixturesScreen> {
 
     return ProdeFixturesView(
       state: state,
-      stale: widget.stale,
       onLogout: widget.onLogout,
       onRetry: notifier.load,
       onRefresh: notifier.refresh,
@@ -76,7 +80,6 @@ class _ProdeFixturesScreenState extends ConsumerState<ProdeFixturesScreen> {
 /// with a concrete [ProdeFixturesState] and callbacks.
 class ProdeFixturesView extends StatelessWidget {
   final ProdeFixturesState state;
-  final bool stale;
   final VoidCallback onLogout;
   final VoidCallback onRetry;
   final Future<void> Function() onRefresh;
@@ -84,7 +87,6 @@ class ProdeFixturesView extends StatelessWidget {
   const ProdeFixturesView({
     super.key,
     required this.state,
-    required this.stale,
     required this.onLogout,
     required this.onRetry,
     required this.onRefresh,
@@ -118,7 +120,6 @@ class ProdeFixturesView extends StatelessWidget {
           selectedFechaId: selectedFechaId,
           isFechaLoading: isFechaLoading,
           fechaLoadError: fechaLoadError,
-          stale: stale,
           onLogout: onLogout,
           onRefresh: onRefresh,
         ),
@@ -219,12 +220,13 @@ class _ErrorView extends StatelessWidget {
 
 /// Shown when a fecha is loaded successfully.
 ///
-/// G6-e: renders [_FechaSelectorRow] above the progress header when the
-/// fechas list is non-empty. A scoped loader ([fecha_load_spinner]) or inline
-/// error ([fecha_load_retry]) replaces the card list while the selection is
-/// in flight or has failed. The prediction modal lock gate is now driven by
-/// the selected [FechaSummary.state] rather than only the client-side lockedAt.
-class _LoadedView extends ConsumerWidget {
+/// T-13: renders a two-tab layout ("A Jugarse" / "Finalizados") with
+/// per-tab fecha filtering. "A Jugarse" shows only open fechas; "Finalizados"
+/// shows locked + evaluated fechas.
+///
+/// G6-e: each tab's [_FechaSelectorRow] operates on its own filtered list so
+/// the picker never shows cross-tab entries.
+class _LoadedView extends ConsumerStatefulWidget {
   final FechaActiva fecha;
   final Map<int, PredictionDraft> drafts;
   final Set<int> savedMatchIds;
@@ -232,7 +234,6 @@ class _LoadedView extends ConsumerWidget {
   final int selectedFechaId;
   final bool isFechaLoading;
   final ProdeFixturesFechaError? fechaLoadError;
-  final bool stale;
   final VoidCallback onLogout;
   final Future<void> Function() onRefresh;
 
@@ -244,21 +245,25 @@ class _LoadedView extends ConsumerWidget {
     required this.selectedFechaId,
     required this.isFechaLoading,
     required this.fechaLoadError,
-    required this.stale,
     required this.onLogout,
     required this.onRefresh,
   });
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_LoadedView> createState() => _LoadedViewState();
+}
+
+class _LoadedViewState extends ConsumerState<_LoadedView> {
+  @override
+  Widget build(BuildContext context) {
     final controller = ref.read(prodeFixturesControllerProvider.notifier);
 
     // G6-e: lock gate derives from the selected FechaSummary.state when
     // available, falling back to the legacy client-side lockedAt check.
-    final selectedSummary = fechas.isEmpty
+    final selectedSummary = widget.fechas.isEmpty
         ? null
-        : fechas.cast<FechaSummary?>().firstWhere(
-              (f) => f!.fechaId == selectedFechaId,
+        : widget.fechas.cast<FechaSummary?>().firstWhere(
+              (f) => f!.fechaId == widget.selectedFechaId,
               orElse: () => null,
             );
 
@@ -269,37 +274,290 @@ class _LoadedView extends ConsumerWidget {
     // Legacy UX-only lock check (pre-G6-e). The summary-state check above
     // takes precedence; this is kept as belt-and-suspenders for the
     // "open but lockedAt in past" edge case.
-    final isLockedByTime =
-        fecha.lockedAt != null && !DateTime.now().isBefore(fecha.lockedAt!);
+    final isLockedByTime = widget.fecha.lockedAt != null &&
+        !DateTime.now().isBefore(widget.fecha.lockedAt!);
 
     final isLocked = isLockedByState || isLockedByTime;
 
-    final totalCount = fecha.matches.length;
-    final predictedCount =
-        fecha.matches.where((m) => savedMatchIds.contains(m.matchId)).length;
+    final totalCount = widget.fecha.matches.length;
+    final predictedCount = widget.fecha.matches
+        .where((m) => widget.savedMatchIds.contains(m.matchId))
+        .length;
 
-    // Current 0-based index of the selected fecha in the list.
-    final selectedIndex = fechas.indexWhere((f) => f.fechaId == selectedFechaId);
+    // "A Jugarse" (embedded in ProdeChamiScreen) surfaces both predictable and
+    // in-play fechas: open (still bettable) and locked (window closed, not yet
+    // evaluated). The locked ones reveal the populares percentages and tag each
+    // match with an "En Juego" label. Evaluated fechas stay out — they belong
+    // to the history list ("Anteriores"), which ProdeChamiScreen owns.
+    final hasFechaList = widget.fechas.isNotEmpty;
+    final playableFechas = widget.fechas
+        .where((f) =>
+            f.state == ProdeFechaState.open ||
+            f.state == ProdeFechaState.locked)
+        .toList();
+
+    // Progress header data — passed into the tab content so it renders below
+    // the selector row (W-1: selector must appear above progress).
+    final showProgress =
+        totalCount > 0 && !widget.isFechaLoading && widget.fechaLoadError == null;
+
+    // No fecha summary list yet: fall back to the single-fecha card area
+    // (no selector). The Chami screen owns the stale banner and fecha badge.
+    if (!hasFechaList) {
+      return RefreshIndicator(
+        onRefresh: widget.onRefresh,
+        child: _buildLegacyCardArea(context, controller, isLocked),
+      );
+    }
+
+    // Safety net: the controller normally selects the active fecha, but if it
+    // landed on an evaluated one (which is excluded from "A Jugarse"), switch
+    // to a playable fecha. Prefer an open (still-bettable) one; fall back to
+    // the first in-play locked fecha so the tab never lands on evaluated.
+    if (playableFechas.isNotEmpty &&
+        !playableFechas.any((f) => f.fechaId == widget.selectedFechaId) &&
+        !widget.isFechaLoading &&
+        widget.fechaLoadError == null) {
+      final defaultPlayable = playableFechas.firstWhere(
+        (f) => f.state == ProdeFechaState.open,
+        orElse: () => playableFechas.first,
+      );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          ref
+              .read(prodeFixturesControllerProvider.notifier)
+              .selectFecha(defaultPlayable.fechaId);
+        }
+      });
+    }
+
+    return _TabContent(
+      tabFechas: playableFechas,
+      fecha: widget.fecha,
+      drafts: widget.drafts,
+      savedMatchIds: widget.savedMatchIds,
+      selectedFechaId: widget.selectedFechaId,
+      isFechaLoading: widget.isFechaLoading,
+      fechaLoadError: widget.fechaLoadError,
+      isLocked: isLocked,
+      onLogout: widget.onLogout,
+      onRefresh: widget.onRefresh,
+      controller: controller,
+      emptyMessage: 'No hay fechas para jugar por ahora.',
+      predictedCount: predictedCount,
+      totalCount: totalCount,
+      showProgress: showProgress,
+      showSelector: playableFechas.length > 1,
+    );
+  }
+
+  /// Legacy single-view card area — used when no fechas summary list is
+  /// available. Equivalent to the pre-T-13 [_buildCardArea] logic.
+  Widget _buildLegacyCardArea(
+    BuildContext context,
+    ProdeFixturesController controller,
+    bool isLocked,
+  ) {
+    if (widget.isFechaLoading) {
+      return const Center(
+        child: CircularProgressIndicator(key: Key('fecha_load_spinner')),
+      );
+    }
+
+    if (widget.fechaLoadError != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('No pudimos cargar esta fecha.'),
+              const SizedBox(height: 12),
+              TextButton(
+                key: const Key('fecha_load_retry'),
+                onPressed: () =>
+                    controller.selectFecha(widget.fechaLoadError!.fechaId),
+                child: const Text('Reintentar'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final sectionTitle = isLocked ? 'PARTIDOS JUGADOS' : 'PRÓXIMOS PARTIDOS';
+
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+          child: Text(
+            sectionTitle,
+            style: const TextStyle(
+              fontWeight: FontWeight.bold,
+              fontSize: 13,
+              letterSpacing: 0.5,
+            ),
+          ),
+        ),
+        if (widget.fecha.matches.isEmpty)
+          const Padding(
+            padding: EdgeInsets.all(24),
+            child: Center(child: Text('Sin partidos en esta fecha.')),
+          )
+        else
+          ...widget.fecha.matches.map((m) {
+            final PredictionEntry? predEntry =
+                widget.fecha.userPredictions.cast<PredictionEntry?>().firstWhere(
+                      (p) => p!.matchId == m.matchId,
+                      orElse: () => null,
+                    );
+            return _MatchCard(
+              match: m,
+              draft: widget.drafts[m.matchId] ?? const PredictionDraft(),
+              isSaved: widget.savedMatchIds.contains(m.matchId),
+              isLocked: isLocked,
+              isEvaluated: widget.fecha.state == ProdeFechaState.evaluated,
+              predictionEntry: predEntry,
+              onTap: () => _openLegacySheet(
+                context,
+                match: m,
+                draft: widget.drafts[m.matchId] ?? const PredictionDraft(),
+                isLocked: isLocked,
+                controller: controller,
+              ),
+            );
+          }),
+        const SizedBox(height: 8),
+        Center(
+          child: TextButton.icon(
+            onPressed: widget.onLogout,
+            icon: const Icon(Icons.logout),
+            label: const Text('Cerrar sesión'),
+          ),
+        ),
+        const SizedBox(height: 16),
+      ],
+    );
+  }
+
+  void _openLegacySheet(
+    BuildContext context, {
+    required FechaMatch match,
+    required PredictionDraft draft,
+    required bool isLocked,
+    required ProdeFixturesController controller,
+  }) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => _PredictionSheet(
+        match: match,
+        initialDraft: draft,
+        isLocked: isLocked,
+        controller: controller,
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-tab content widget
+// ---------------------------------------------------------------------------
+
+/// Renders the content for one tab of the two-tab split.
+///
+/// [tabFechas] is the tab-filtered subset of all fechas (open only, or
+/// locked+evaluated only). When empty, shows [emptyMessage] instead of
+/// the card list.
+///
+/// Layout order (W-1): selector row → progress header → card area.
+class _TabContent extends StatelessWidget {
+  /// Fechas visible in this tab (filtered by state).
+  final List<FechaSummary> tabFechas;
+
+  final FechaActiva fecha;
+  final Map<int, PredictionDraft> drafts;
+  final Set<int> savedMatchIds;
+  final int selectedFechaId;
+  final bool isFechaLoading;
+  final ProdeFixturesFechaError? fechaLoadError;
+  final bool isLocked;
+  final VoidCallback onLogout;
+  final Future<void> Function() onRefresh;
+  final ProdeFixturesController controller;
+  final String emptyMessage;
+
+  /// Progress header data — rendered between selector and card area (W-1).
+  final int predictedCount;
+  final int totalCount;
+  final bool showProgress;
+
+  /// Whether to render the "< Fecha N >" selector row. Defaults to true.
+  /// Set false to hide it (e.g. a single open fecha in [ProdeChamiScreen]).
+  final bool showSelector;
+
+  const _TabContent({
+    required this.tabFechas,
+    required this.fecha,
+    required this.drafts,
+    required this.savedMatchIds,
+    required this.selectedFechaId,
+    required this.isFechaLoading,
+    required this.fechaLoadError,
+    required this.isLocked,
+    required this.onLogout,
+    required this.onRefresh,
+    required this.controller,
+    required this.emptyMessage,
+    this.predictedCount = 0,
+    this.totalCount = 0,
+    this.showProgress = false,
+    this.showSelector = true,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    // If this tab has no fechas at all, show the empty state.
+    if (tabFechas.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            emptyMessage,
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
+
+    // Compute selectedIndex within the tab-filtered list.
+    final selectedIndex =
+        tabFechas.indexWhere((f) => f.fechaId == selectedFechaId);
 
     return Column(
       children: [
-        if (stale) const _StaleBanner(),
-        _FechaBadge(state: fecha.state),
-        // G6-e: selector row above progress header, only when list is non-empty.
-        if (fechas.isNotEmpty)
+        // G6-e: selector row above the progress header (W-1).
+        if (showSelector)
           _FechaSelectorRow(
-            fechas: fechas,
+            fechas: tabFechas,
             selectedIndex: selectedIndex,
             onPrev: selectedIndex > 0
-                ? () => controller.selectFecha(fechas[selectedIndex - 1].fechaId)
+                ? () =>
+                    controller.selectFecha(tabFechas[selectedIndex - 1].fechaId)
                 : null,
-            onNext: selectedIndex < fechas.length - 1
-                ? () => controller.selectFecha(fechas[selectedIndex + 1].fechaId)
+            onNext: selectedIndex < tabFechas.length - 1
+                ? () =>
+                    controller.selectFecha(tabFechas[selectedIndex + 1].fechaId)
                 : null,
             onSelect: (id) => controller.selectFecha(id),
           ),
-        // Progress header
-        if (totalCount > 0 && !isFechaLoading && fechaLoadError == null)
+        // Progress header below the selector (W-1).
+        if (showProgress)
           _ProgressHeader(
             predictedCount: predictedCount,
             totalCount: totalCount,
@@ -307,18 +565,14 @@ class _LoadedView extends ConsumerWidget {
         Expanded(
           child: RefreshIndicator(
             onRefresh: onRefresh,
-            child: _buildCardArea(context, controller, isLocked),
+            child: _buildCardArea(context),
           ),
         ),
       ],
     );
   }
 
-  Widget _buildCardArea(
-    BuildContext context,
-    ProdeFixturesController controller,
-    bool isLocked,
-  ) {
+  Widget _buildCardArea(BuildContext context) {
     // G6-e: scoped loading indicator.
     if (isFechaLoading) {
       return const Center(
@@ -371,19 +625,29 @@ class _LoadedView extends ConsumerWidget {
             child: Center(child: Text('Sin partidos en esta fecha.')),
           )
         else
-          ...fecha.matches.map((m) => _MatchCard(
+          ...fecha.matches.map((m) {
+            // Find the user's saved prediction for this match (if any).
+            final PredictionEntry? predEntry =
+                fecha.userPredictions.cast<PredictionEntry?>().firstWhere(
+                      (p) => p!.matchId == m.matchId,
+                      orElse: () => null,
+                    );
+            return _MatchCard(
+              match: m,
+              draft: drafts[m.matchId] ?? const PredictionDraft(),
+              isSaved: savedMatchIds.contains(m.matchId),
+              isLocked: isLocked,
+              isEvaluated: fecha.state == ProdeFechaState.evaluated,
+              predictionEntry: predEntry,
+              onTap: () => _openPredictionSheet(
+                context,
                 match: m,
                 draft: drafts[m.matchId] ?? const PredictionDraft(),
-                isSaved: savedMatchIds.contains(m.matchId),
                 isLocked: isLocked,
-                onTap: () => _openPredictionSheet(
-                  context,
-                  match: m,
-                  draft: drafts[m.matchId] ?? const PredictionDraft(),
-                  isLocked: isLocked,
-                  controller: controller,
-                ),
-              )),
+                controller: controller,
+              ),
+            );
+          }),
         const SizedBox(height: 8),
         Center(
           child: TextButton.icon(
@@ -640,19 +904,37 @@ class _FechaPickerSheet extends StatelessWidget {
 ///   Header row: kickoff + zona | status icon
 ///   Divider
 ///   Body row: [home escudo+name] | [home score box] - [away score box] | [away escudo+name]
+///   (evaluated + isFinal) Result badge row: color badge + real-score line
 class _MatchCard extends StatelessWidget {
   final FechaMatch match;
   final PredictionDraft draft;
   final bool isSaved;
   final bool isLocked;
-  final VoidCallback onTap;
+
+  /// True when the parent fecha is in the [ProdeFechaState.evaluated] state.
+  final bool isEvaluated;
+
+  /// The user's saved prediction for this match. Null when the user has not
+  /// predicted this match or the fecha is not yet evaluated.
+  final PredictionEntry? predictionEntry;
+
+  /// Tap handler. Null makes the card non-interactive (read-only), used by the
+  /// "Anteriores" history list.
+  final VoidCallback? onTap;
+
+  /// Whether to render the top-right status icon (saved / locked / pending).
+  /// False for read-only history cards. Defaults to true.
+  final bool showStatusIcon;
 
   const _MatchCard({
     required this.match,
     required this.draft,
     required this.isSaved,
     required this.isLocked,
-    required this.onTap,
+    this.onTap,
+    this.isEvaluated = false,
+    this.predictionEntry,
+    this.showStatusIcon = true,
   });
 
   @override
@@ -663,13 +945,30 @@ class _MatchCard extends StatelessWidget {
     // Format: "Dom. 07/06 - 14:00" (abbreviated weekday, capitalized)
     final kickoffFormatted = _formatKickoff(match.kickoff);
 
+    // Resolve evaluation style when the fecha is evaluated and the user has
+    // a prediction for this match. Null otherwise (open/locked fecha, or no
+    // prediction — no badge shown).
+    final PredictionResultStyle? evalStyle =
+        (isEvaluated && predictionEntry != null)
+            ? resolvePredictionStyle(
+                method: predictionEntry!.evaluationMethod,
+                points: predictionEntry!.points,
+              )
+            : null;
+
+    // Border color: use evalStyle color when final+evaluated, else default grey.
+    final borderColor = (evalStyle != null && match.isFinal)
+        ? evalStyle.color.withAlpha(180)
+        : Colors.grey.shade200;
+    final borderWidth = (evalStyle != null && match.isFinal) ? 1.5 : 1.0;
+
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
       child: Card(
         color: Colors.white,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: BorderSide(color: Colors.grey.shade200),
+          side: BorderSide(color: borderColor, width: borderWidth),
         ),
         elevation: 1,
         child: InkWell(
@@ -708,28 +1007,83 @@ class _MatchCard extends StatelessWidget {
                         ],
                       ),
                     ),
-                    // Status icon
-                    if (isSaved)
-                      Icon(
-                        key: Key('status_icon_saved_${match.matchId}'),
-                        Icons.check_box_outlined,
-                        color: primary,
-                        size: 20,
-                      )
-                    else if (isLocked)
-                      Icon(
-                        key: Key('status_icon_locked_${match.matchId}'),
-                        Icons.lock_outline,
-                        color: Colors.grey.shade400,
-                        size: 20,
-                      )
-                    else
-                      Icon(
-                        key: Key('status_icon_pending_${match.matchId}'),
-                        Icons.indeterminate_check_box_outlined,
-                        color: Colors.grey.shade400,
-                        size: 20,
-                      ),
+                    // Status indicator (hidden for read-only history cards).
+                    // A locked, not-yet-evaluated match shows an "En Juego"
+                    // label: its fecha is closed, betting is over, and it is
+                    // about to be (or being) played.
+                    if (showStatusIcon)
+                      if (isLocked && !isEvaluated)
+                        Container(
+                          key: Key('en_juego_label_${match.matchId}'),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.amber.shade100,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.sports_soccer,
+                                size: 12,
+                                color: Colors.orange.shade800,
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                'En Juego',
+                                style: TextStyle(
+                                  color: Colors.orange.shade800,
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      else if (draft.status == SubmitStatus.error)
+                        // A previous submit attempt for this match failed and
+                        // was never retried successfully. The score shown
+                        // alongside this icon is still the last
+                        // server-confirmed value (or none) — never the failed
+                        // attempt — but the icon itself must make the failure
+                        // impossible to miss.
+                        //
+                        // This is checked BEFORE isSaved on purpose. The common
+                        // case is editing a prediction that is already saved:
+                        // isSaved stays true, so ordering it first would show a
+                        // green checkmark over a failed edit and tell the user
+                        // the exact opposite of what happened. An error always
+                        // wins the badge.
+                        Icon(
+                          key: Key('status_icon_error_${match.matchId}'),
+                          Icons.error_outline,
+                          color: Colors.red.shade400,
+                          size: 20,
+                        )
+                      else if (isSaved)
+                        Icon(
+                          key: Key('status_icon_saved_${match.matchId}'),
+                          Icons.check_box_outlined,
+                          color: primary,
+                          size: 20,
+                        )
+                      else if (isLocked)
+                        Icon(
+                          key: Key('status_icon_locked_${match.matchId}'),
+                          Icons.lock_outline,
+                          color: Colors.grey.shade400,
+                          size: 20,
+                        )
+                      else
+                        Icon(
+                          key: Key('status_icon_pending_${match.matchId}'),
+                          Icons.indeterminate_check_box_outlined,
+                          color: Colors.grey.shade400,
+                          size: 20,
+                        ),
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -757,7 +1111,7 @@ class _MatchCard extends StatelessWidget {
                         ],
                       ),
                     ),
-                    // Score display boxes
+                    // Score display boxes (user's predicted score)
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 8),
                       child: Row(
@@ -803,6 +1157,66 @@ class _MatchCard extends StatelessWidget {
                     ),
                   ],
                 ),
+                // Evaluation badge — shown when fecha is evaluated and user
+                // has a prediction (regardless of isFinal).
+                if (evalStyle != null) ...[
+                  const SizedBox(height: 8),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Container(
+                        key: Key('result_badge_${match.matchId}'),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: evalStyle.color.withAlpha(30),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: evalStyle.color.withAlpha(180),
+                            width: 1,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              evalStyle.icon,
+                              size: 14,
+                              color: evalStyle.color,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              evalStyle.label,
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: evalStyle.color,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+                // Real-score line — shown only when match.isFinal is true.
+                if (match.isFinal &&
+                    match.realScoreHome != null &&
+                    match.realScoreAway != null) ...[
+                  const SizedBox(height: 4),
+                  Center(
+                    child: Text(
+                      key: Key('real_score_line_${match.matchId}'),
+                      'Resultado: ${match.realScoreHome} - ${match.realScoreAway}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: Colors.grey.shade600,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -922,67 +1336,18 @@ class _StaleBanner extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Fecha badge
-// ---------------------------------------------------------------------------
-
-/// Optional badge shown near the top of the list when the fecha is not open.
-///
-/// - [ProdeFechaState.locked]    → amber "Fecha Cerrada" chip
-/// - [ProdeFechaState.evaluated] → secondary "Finalizada" chip
-/// - [ProdeFechaState.open] / [ProdeFechaState.unknown] → nothing
-class _FechaBadge extends StatelessWidget {
-  final ProdeFechaState state;
-
-  const _FechaBadge({required this.state});
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
-    String? label;
-    Color? background;
-    Color? foreground;
-
-    switch (state) {
-      case ProdeFechaState.locked:
-        label = 'Fecha Cerrada';
-        background = Colors.amber.shade100;
-        foreground = Colors.orange.shade800;
-      case ProdeFechaState.evaluated:
-        label = 'Finalizada';
-        background = theme.colorScheme.secondaryContainer;
-        foreground = theme.colorScheme.onSecondaryContainer;
-      case ProdeFechaState.open:
-      case ProdeFechaState.unknown:
-        return const SizedBox.shrink();
-    }
-
-    final baseStyle = theme.textTheme.labelMedium;
-
-    return Container(
-      width: double.infinity,
-      color: background,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-      child: Text(
-        label,
-        textAlign: TextAlign.center,
-        style: baseStyle?.copyWith(
-          color: foreground,
-          fontSize: (baseStyle.fontSize ?? 12) + 1,
-        ),
-      ),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Prediction sheet (modal bottom sheet)
 // ---------------------------------------------------------------------------
 
 /// Modal bottom sheet for entering or editing a match prediction.
 ///
 /// Opened via [showModalBottomSheet]. Holds local score state initialized
-/// from the existing [initialDraft] (or 0/0 when no prior prediction).
+/// from the existing [initialDraft] — null/null when there is no prior
+/// prediction, so the steppers start UNTOUCHED (displayed as "—", not "0").
+///
+/// A 0-0 scoreline is a real, valid prediction, so it must stay reachable
+/// with a single tap — but it must be a deliberate choice, not the value a
+/// reflex tap on GUARDAR happens to submit. See [_canSubmit].
 ///
 /// When [isLocked] is true, steppers and the GUARDAR button are disabled.
 class _PredictionSheet extends StatefulWidget {
@@ -1003,43 +1368,61 @@ class _PredictionSheet extends StatefulWidget {
 }
 
 class _PredictionSheetState extends State<_PredictionSheet> {
-  late int _homeScore;
-  late int _awayScore;
+  // Null means "not chosen yet" — distinct from a deliberate 0. The stepper
+  // shows "—" while null; the first tap (either + or -) gives it a concrete
+  // value and the sheet becomes submittable.
+  int? _homeScore;
+  int? _awayScore;
   bool _submitting = false;
   String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
-    _homeScore = widget.initialDraft.scoreHome ?? 0;
-    _awayScore = widget.initialDraft.scoreAway ?? 0;
+    _homeScore = widget.initialDraft.scoreHome;
+    _awayScore = widget.initialDraft.scoreAway;
   }
 
   int _clamp(int value) => value.clamp(0, 255);
 
-  void _incrementHome() => setState(() => _homeScore = _clamp(_homeScore + 1));
-  void _decrementHome() => setState(() => _homeScore = _clamp(_homeScore - 1));
-  void _incrementAway() => setState(() => _awayScore = _clamp(_awayScore + 1));
-  void _decrementAway() => setState(() => _awayScore = _clamp(_awayScore - 1));
+  // First tap of "+" on an untouched stepper starts counting from 1 (one
+  // goal scored); first tap of "-" starts from 0 (an explicit "no goals"),
+  // so picking 0-0 on purpose still only takes one tap per side.
+  void _incrementHome() =>
+      setState(() => _homeScore = _clamp((_homeScore ?? 0) + 1));
+  void _decrementHome() =>
+      setState(() => _homeScore = _clamp((_homeScore ?? 1) - 1));
+  void _incrementAway() =>
+      setState(() => _awayScore = _clamp((_awayScore ?? 0) + 1));
+  void _decrementAway() =>
+      setState(() => _awayScore = _clamp((_awayScore ?? 1) - 1));
 
   Future<void> _onGuardar() async {
-    if (widget.isLocked || _submitting) return;
+    final homeScore = _homeScore;
+    final awayScore = _awayScore;
+    if (widget.isLocked || _submitting || homeScore == null || awayScore == null) {
+      return;
+    }
 
     setState(() {
       _submitting = true;
       _errorMessage = null;
     });
 
-    widget.controller.updateDraft(
-      widget.match.matchId,
-      scoreHome: _homeScore,
-      scoreAway: _awayScore,
-    );
-
+    // Send the POST first. The shared draft (and the match card behind this
+    // sheet, which renders straight from it) is only updated by the
+    // controller once the server has actually confirmed the score — see
+    // ProdeFixturesController.submitPrediction. That way the card can never
+    // show a value the server didn't accept, and there is nothing to roll
+    // back on failure.
+    //
     // submitPrediction returns true on success, false on error/no-op.
     // This avoids reading the protected StateNotifier.state from outside the notifier.
-    final success =
-        await widget.controller.submitPrediction(widget.match.matchId);
+    final success = await widget.controller.submitPrediction(
+      widget.match.matchId,
+      scoreHome: homeScore,
+      scoreAway: awayScore,
+    );
 
     if (!mounted) return;
 
@@ -1059,6 +1442,7 @@ class _PredictionSheetState extends State<_PredictionSheet> {
     final primary = theme.colorScheme.primary;
     final matchId = widget.match.matchId;
     final canInteract = !widget.isLocked && !_submitting;
+    final canSubmit = canInteract && _homeScore != null && _awayScore != null;
 
     return Padding(
       padding: EdgeInsets.only(
@@ -1181,7 +1565,7 @@ class _PredictionSheetState extends State<_PredictionSheet> {
                     borderRadius: BorderRadius.circular(10),
                   ),
                 ),
-                onPressed: canInteract ? _onGuardar : null,
+                onPressed: canSubmit ? _onGuardar : null,
                 child: _submitting
                     ? const SizedBox(
                         width: 20,
@@ -1223,11 +1607,18 @@ class _PopularesSection extends StatelessWidget {
   final int matchId;
   final Color primaryColor;
 
+  /// Text shown (as the inline hint and the info tooltip) when percentages are
+  /// not revealed. Defaults to the open-fecha wording. The history sheet passes
+  /// a different message because "cuando cierra la fecha" makes no sense for a
+  /// match that has already been played.
+  final String lockedHint;
+
   const _PopularesSection({
     required this.populares,
     required this.isLocked,
     required this.matchId,
     required this.primaryColor,
+    this.lockedHint = 'Se revelan cuando cierra la fecha',
   });
 
   @override
@@ -1238,9 +1629,9 @@ class _PopularesSection extends StatelessWidget {
     int? drawPercent;
     int? awayPercent;
     if (reveal) {
-      homePercent = (populares!.home * 100).round();
-      drawPercent = (populares!.draw * 100).round();
-      awayPercent = (populares!.away * 100).round();
+      homePercent = populares!.home.round();
+      drawPercent = populares!.draw.round();
+      awayPercent = populares!.away.round();
     }
 
     return Container(
@@ -1267,7 +1658,7 @@ class _PopularesSection extends StatelessWidget {
               Semantics(
                 label: 'Información sobre pronósticos populares',
                 child: Tooltip(
-                  message: 'Se revelan cuando cierra la fecha',
+                  message: lockedHint,
                   child: IconButton(
                     icon: const Icon(Icons.info_outline, size: 18),
                     color: Colors.grey.shade500,
@@ -1310,7 +1701,7 @@ class _PopularesSection extends StatelessWidget {
             Center(
               child: Text(
                 key: const Key('populares_locked_hint'),
-                'Se revelan cuando cierra la fecha',
+                lockedHint,
                 style: TextStyle(
                   fontSize: 11,
                   color: Colors.grey.shade500,
@@ -1395,7 +1786,10 @@ class _PopularesChip extends StatelessWidget {
 class _ScoreStepper extends StatelessWidget {
   final int matchId;
   final String side; // 'home' or 'away'
-  final int value;
+
+  /// The chosen score, or null when the user hasn't picked one yet (shown
+  /// as "—", distinct from an explicit 0).
+  final int? value;
   final bool enabled;
   final VoidCallback? onIncrement;
   final VoidCallback? onDecrement;
@@ -1439,7 +1833,7 @@ class _ScoreStepper extends StatelessWidget {
           child: Center(
             child: Text(
               key: Key('stepper_${side}_value_$matchId'),
-              value.toString(),
+              value?.toString() ?? '—',
               style: TextStyle(
                 fontWeight: FontWeight.bold,
                 fontSize: 18,
@@ -1459,6 +1853,835 @@ class _ScoreStepper extends StatelessWidget {
           constraints: const BoxConstraints(),
         ),
       ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Prode Chami screen (summary card + Anteriores/A Jugarse)
+// ---------------------------------------------------------------------------
+
+/// The authenticated Prode landing ("Prode Chami").
+///
+/// Composition (top → bottom):
+///   1. Stale banner (when bootstrapped with stale tokens).
+///   2. Ranking summary card — the caller's position in the last fecha and the
+///      general ranking; tapping a half opens [ProdeRankingScreen] on that tab.
+///   3. "Pronósticos" heading + a [ProdeSegmentedToggle] (Anteriores / A Jugarse).
+///   4. The selected segment's body:
+///        - Anteriores → [ProdeHistoryList] (paginated past predictions).
+///        - A Jugarse  → [ProdeFixturesScreen] (the editable open/locked-fecha
+///          flow with per-match "En Juego" labels and populares reveal).
+///
+/// Rendered by [ProdeAuthView] in the Authenticated state, inside
+/// [ProdeAuthGate]'s Scaffold — so this widget returns a [Column], not a
+/// Scaffold. [stale]/[onLogout] are forwarded from that arm.
+class ProdeChamiScreen extends ConsumerStatefulWidget {
+  final bool stale;
+  final VoidCallback onLogout;
+
+  const ProdeChamiScreen({
+    super.key,
+    required this.stale,
+    required this.onLogout,
+  });
+
+  @override
+  ConsumerState<ProdeChamiScreen> createState() => _ProdeChamiScreenState();
+}
+
+class _ProdeChamiScreenState extends ConsumerState<ProdeChamiScreen> {
+  // 0 = Anteriores, 1 = A Jugarse. Defaults to Anteriores (past predictions).
+  int _segment = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    // Kick off the ranking loads that feed the summary card. Each controller
+    // guards re-entry, so this is a no-op when already loaded. The history list
+    // and the embedded fixtures screen self-bootstrap in their own initState.
+    Future.microtask(() {
+      if (!mounted) return;
+      if (ref.read(prodeFechaRankingControllerProvider)
+          is ProdeRankingLoading) {
+        ref.read(prodeFechaRankingControllerProvider.notifier).load();
+      }
+      if (ref.read(prodeRankingControllerProvider) is ProdeRankingLoading) {
+        ref.read(prodeRankingControllerProvider.notifier).load();
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Column(
+      children: [
+        if (widget.stale) const _StaleBanner(),
+        const _ProdeRankingSummaryCard(),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Pronósticos',
+              style: theme.textTheme.titleLarge?.copyWith(
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          child: ProdeSegmentedToggle(
+            labels: const ['Anteriores', 'A Jugarse'],
+            selectedIndex: _segment,
+            onChanged: (i) => setState(() => _segment = i),
+          ),
+        ),
+        Expanded(
+          child: _segment == 0
+              ? ProdeHistoryList(onLogout: widget.onLogout)
+              : ProdeFixturesScreen(
+                  // Stale banner is owned by this screen; logout reused as-is.
+                  onLogout: widget.onLogout,
+                ),
+        ),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Ranking summary card
+// ---------------------------------------------------------------------------
+
+/// The clickable two-up ranking summary at the top of [ProdeChamiScreen].
+///
+/// Left half = "Ranking de la Fecha" (last evaluated fecha), right half =
+/// "Ranking general". Each shows the caller's puesto (rank) and puntos from the
+/// `me` object of the respective ranking controller. Tapping a half opens
+/// [ProdeRankingScreen] on the matching tab. Shows "—" until data loads (or
+/// when the caller is unranked / anonymous).
+class _ProdeRankingSummaryCard extends ConsumerWidget {
+  const _ProdeRankingSummaryCard();
+
+  RankingMe? _meOf(ProdeRankingState state) =>
+      state is ProdeRankingLoaded ? state.page.me : null;
+
+  void _openRanking(BuildContext context, int tab) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ProdeRankingScreen(initialTab: tab),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final theme = Theme.of(context);
+    final primary = theme.colorScheme.primary;
+
+    final fechaMe = _meOf(ref.watch(prodeFechaRankingControllerProvider));
+    final generalMe = _meOf(ref.watch(prodeRankingControllerProvider));
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      child: Container(
+        decoration: BoxDecoration(
+          color: primary.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: primary.withValues(alpha: 0.20)),
+        ),
+        child: IntrinsicHeight(
+          child: Row(
+            children: [
+              Expanded(
+                child: InkWell(
+                  key: const Key('summary_half_fecha'),
+                  onTap: () => _openRanking(context, 0),
+                  borderRadius: const BorderRadius.horizontal(
+                    left: Radius.circular(12),
+                  ),
+                  child: _SummaryHalf(
+                    title: 'Ranking de la Fecha',
+                    me: fechaMe,
+                  ),
+                ),
+              ),
+              VerticalDivider(
+                width: 1,
+                thickness: 1,
+                color: primary.withValues(alpha: 0.20),
+              ),
+              Expanded(
+                child: InkWell(
+                  key: const Key('summary_half_general'),
+                  onTap: () => _openRanking(context, 1),
+                  child: _SummaryHalf(
+                    title: 'Ranking general',
+                    me: generalMe,
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Icon(Icons.chevron_right, color: primary),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// One half of the [_ProdeRankingSummaryCard]: a title plus puesto/puntos.
+class _SummaryHalf extends StatelessWidget {
+  final String title;
+  final RankingMe? me;
+
+  const _SummaryHalf({required this.title, required this.me});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final primary = theme.colorScheme.primary;
+
+    final rankLabel = me != null ? '#${me!.rank}' : '—';
+    final pointsLabel = me != null ? '${me!.totalPoints}' : '—';
+    // Black by default; green only when the user is first (rank == 1) in THIS
+    // ranking; grey for the "—" placeholder (loading / unranked).
+    final Color statColor;
+    if (me == null) {
+      statColor = Colors.grey.shade400;
+    } else if (me!.rank == 1) {
+      statColor = Colors.green.shade700;
+    } else {
+      statColor = Colors.black87;
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.titleSmall?.copyWith(
+              color: primary,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _SummaryStat(
+                  value: rankLabel, label: 'Puesto', valueColor: statColor),
+              _SummaryStat(
+                  value: pointsLabel, label: 'Puntos', valueColor: statColor),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// A big value over a small grey caption (e.g. "#1" / "Puesto").
+class _SummaryStat extends StatelessWidget {
+  final String value;
+  final String label;
+  final Color valueColor;
+
+  const _SummaryStat({
+    required this.value,
+    required this.label,
+    required this.valueColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          value,
+          style: theme.textTheme.titleLarge?.copyWith(
+            fontWeight: FontWeight.bold,
+            color: valueColor,
+          ),
+        ),
+        Text(
+          label,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: Colors.grey.shade600,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Anteriores — paginated history list
+// ---------------------------------------------------------------------------
+
+/// The "Anteriores" tab: an infinite-scroll list of the caller's past
+/// predictions (15 per page), driven by [prodeHistoryControllerProvider].
+///
+/// Reuses [_MatchCard] (no status icon) via [_HistoryCard] so
+/// finished-prediction cards look identical to the fixtures cards. Tapping a
+/// card opens the read-only [_HistorySheet].
+class ProdeHistoryList extends ConsumerStatefulWidget {
+  final VoidCallback onLogout;
+
+  const ProdeHistoryList({super.key, required this.onLogout});
+
+  @override
+  ConsumerState<ProdeHistoryList> createState() => _ProdeHistoryListState();
+}
+
+class _ProdeHistoryListState extends ConsumerState<ProdeHistoryList> {
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController.addListener(_onScroll);
+    Future.microtask(() {
+      if (mounted) {
+        ref.read(prodeHistoryControllerProvider.notifier).load();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _scrollController.removeListener(_onScroll);
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_scrollController.hasClients) return;
+    final pos = _scrollController.position;
+    // Trigger the next page when within 400px of the bottom.
+    if (pos.pixels >= pos.maxScrollExtent - 400) {
+      ref.read(prodeHistoryControllerProvider.notifier).loadMore();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = ref.watch(prodeHistoryControllerProvider);
+    final notifier = ref.read(prodeHistoryControllerProvider.notifier);
+
+    if (state.phase == ProdeHistoryPhase.loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (state.phase == ProdeHistoryPhase.error) {
+      return _HistoryMessage(
+        icon: Icons.error_outline,
+        title: 'Algo salió mal',
+        message:
+            'No pudimos cargar tus pronósticos. Revisá tu conexión y reintentá.',
+        actionLabel: 'Reintentar',
+        onAction: notifier.load,
+      );
+    }
+
+    if (state.isEmpty) {
+      return RefreshIndicator(
+        onRefresh: notifier.refresh,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          children: const [
+            SizedBox(height: 80),
+            _HistoryEmpty(),
+          ],
+        ),
+      );
+    }
+
+    // Loaded with items: list + a trailing footer slot (spinner / retry).
+    return RefreshIndicator(
+      onRefresh: notifier.refresh,
+      child: ListView.builder(
+        controller: _scrollController,
+        physics: const AlwaysScrollableScrollPhysics(),
+        itemCount: state.items.length + 1,
+        itemBuilder: (context, i) {
+          if (i < state.items.length) {
+            return _HistoryCard(entry: state.items[i]);
+          }
+          return _HistoryFooter(
+            state: state,
+            onRetry: notifier.loadMore,
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// Footer below the history list: a spinner while paging, an inline retry when
+/// the last page failed, or empty space when there is nothing more to load.
+class _HistoryFooter extends StatelessWidget {
+  final ProdeHistoryState state;
+  final VoidCallback onRetry;
+
+  const _HistoryFooter({required this.state, required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    if (state.isLoadingMore) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 20),
+        child: Center(
+          child: SizedBox(
+            width: 24,
+            height: 24,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    if (state.loadMoreFailed) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        child: Center(
+          child: TextButton(
+            onPressed: onRetry,
+            child: const Text('Cargar más'),
+          ),
+        ),
+      );
+    }
+    return const SizedBox(height: 24);
+  }
+}
+
+/// Finished-prediction card. Adapts a [PredictionHistoryEntry] to the shared
+/// [_MatchCard] so it renders identically to fixtures cards (score boxes,
+/// evaluation badge, "Resultado: X - Y" line) without a status icon.
+///
+/// Tapping opens the read-only [_HistorySheet], which adds the "Pronósticos
+/// populares" distribution for the played match.
+class _HistoryCard extends ConsumerWidget {
+  final PredictionHistoryEntry entry;
+
+  const _HistoryCard({required this.entry});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final match = FechaMatch(
+      matchId: entry.matchId,
+      homeTeam: entry.homeTeam,
+      awayTeam: entry.awayTeam,
+      kickoff: entry.kickoff,
+      zona: entry.zona,
+      homeEscudo: entry.homeEscudo,
+      awayEscudo: entry.awayEscudo,
+      realScoreHome: entry.realScoreHome,
+      realScoreAway: entry.realScoreAway,
+      isFinal: entry.isFinal,
+    );
+
+    return _MatchCard(
+      match: match,
+      draft: PredictionDraft(
+        scoreHome: entry.scoreHome,
+        scoreAway: entry.scoreAway,
+      ),
+      isSaved: false,
+      isLocked: false,
+      showStatusIcon: false,
+      // Show the evaluation badge once points have been awarded.
+      isEvaluated: entry.points != null,
+      predictionEntry: PredictionEntry(
+        matchId: entry.matchId,
+        scoreHome: entry.scoreHome,
+        scoreAway: entry.scoreAway,
+        points: entry.points,
+        evaluationMethod: entry.evaluationMethod,
+      ),
+      onTap: () => _openHistorySheet(context, ref),
+    );
+  }
+
+  void _openHistorySheet(BuildContext context, WidgetRef ref) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => _HistorySheet(
+        entry: entry,
+        api: ref.read(prodeApiServiceProvider),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// History detail sheet (read-only)
+// ---------------------------------------------------------------------------
+
+/// Read-only detail sheet for a finished prediction, opened from [_HistoryCard].
+///
+/// Deliberately NOT [_PredictionSheet]: a played match has nothing to edit, so
+/// there are no steppers and no GUARDAR button, and the sheet needs no
+/// [ProdeFixturesController] (the "Anteriores" tab is driven by
+/// [prodeHistoryControllerProvider]).
+///
+/// `GET /prode/predicciones` does not carry `populares`, so they are fetched on
+/// open from `GET /prode/fecha/{fechaId}` and matched by `match_id`. A failed
+/// fetch degrades to an inline retry — the prediction, result and points come
+/// from [entry] and render regardless.
+class _HistorySheet extends StatefulWidget {
+  final PredictionHistoryEntry entry;
+  final ProdeApiService api;
+
+  const _HistorySheet({required this.entry, required this.api});
+
+  @override
+  State<_HistorySheet> createState() => _HistorySheetState();
+}
+
+class _HistorySheetState extends State<_HistorySheet> {
+  Populares? _populares;
+  bool _loading = true;
+  bool _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPopulares();
+  }
+
+  Future<void> _loadPopulares() async {
+    setState(() {
+      _loading = true;
+      _failed = false;
+    });
+
+    try {
+      final fecha = await widget.api.fetchFechaById(widget.entry.fechaId);
+
+      // The payload carries every match of the round; pick ours by id. A match
+      // that is no longer in the fecha yields null populares, not an error.
+      Populares? found;
+      for (final m in fecha.matches) {
+        if (m.matchId == widget.entry.matchId) {
+          found = m.populares;
+          break;
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _populares = found;
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _failed = true;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final primary = theme.colorScheme.primary;
+    final entry = widget.entry;
+
+    final PredictionResultStyle? evalStyle = entry.points != null
+        ? resolvePredictionStyle(
+            method: entry.evaluationMethod,
+            points: entry.points,
+          )
+        : null;
+
+    return SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Drag handle
+          const SizedBox(height: 12),
+          Center(
+            child: Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.grey.shade300,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          _buildPopulares(primary),
+
+          // Teams + the user's prediction (read-only)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Expanded(
+                  child: Column(
+                    children: [
+                      _EscudoImage(url: entry.homeEscudo, size: 48),
+                      const SizedBox(height: 4),
+                      Text(
+                        entry.homeTeam,
+                        textAlign: TextAlign.center,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(fontWeight: FontWeight.w600),
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Row(
+                    children: [
+                      _ScoreDisplayBox(
+                        value: entry.scoreHome,
+                        primaryColor: primary,
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 4),
+                        child: Text(
+                          '-',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                      ),
+                      _ScoreDisplayBox(
+                        value: entry.scoreAway,
+                        primaryColor: primary,
+                      ),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: Column(
+                    children: [
+                      _EscudoImage(url: entry.awayEscudo, size: 48),
+                      const SizedBox(height: 4),
+                      Text(
+                        entry.awayTeam,
+                        textAlign: TextAlign.center,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(fontWeight: FontWeight.w600),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Tu pronóstico',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: Colors.grey.shade600,
+            ),
+          ),
+
+          // Official result
+          if (entry.realScoreHome != null && entry.realScoreAway != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              key: Key('history_real_score_${entry.matchId}'),
+              'Resultado: ${entry.realScoreHome} - ${entry.realScoreAway}',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+
+          // Points badge
+          if (evalStyle != null) ...[
+            const SizedBox(height: 10),
+            Container(
+              key: Key('history_result_badge_${entry.matchId}'),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: evalStyle.color.withAlpha(30),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: evalStyle.color.withAlpha(180),
+                  width: 1,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(evalStyle.icon, size: 14, color: evalStyle.color),
+                  const SizedBox(width: 4),
+                  Text(
+                    evalStyle.label,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: evalStyle.color,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+
+          const SizedBox(height: 20),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
+            child: SizedBox(
+              width: double.infinity,
+              child: TextButton(
+                key: Key('history_cerrar_${entry.matchId}'),
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('CERRAR'),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Populares slot: spinner while fetching, inline retry on failure, otherwise
+  /// the shared section with `isLocked: true` so percentages are revealed.
+  Widget _buildPopulares(Color primary) {
+    if (_loading) {
+      return const Padding(
+        key: Key('history_populares_loading'),
+        padding: EdgeInsets.symmetric(vertical: 24),
+        child: SizedBox(
+          width: 24,
+          height: 24,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      );
+    }
+
+    if (_failed) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(24, 0, 24, 12),
+        child: Column(
+          children: [
+            Text(
+              'No pudimos cargar los pronósticos populares.',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+            ),
+            TextButton(
+              key: const Key('history_populares_retry'),
+              onPressed: _loadPopulares,
+              child: const Text('Reintentar'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return _PopularesSection(
+      populares: _populares,
+      isLocked: true,
+      matchId: widget.entry.matchId,
+      primaryColor: primary,
+      lockedHint: 'No hay datos de pronósticos para este partido',
+    );
+  }
+}
+
+/// Empty state for the "Anteriores" list (no past predictions yet).
+class _HistoryEmpty extends StatelessWidget {
+  const _HistoryEmpty();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.history, size: 64, color: theme.colorScheme.primary),
+            const SizedBox(height: 16),
+            Text(
+              'Todavía no tenés pronósticos anteriores',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Cuando se jueguen las fechas que pronosticaste vas a verlas acá.',
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Icon + title + message + retry button for the history error state.
+class _HistoryMessage extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String message;
+  final String actionLabel;
+  final VoidCallback onAction;
+
+  const _HistoryMessage({
+    required this.icon,
+    required this.title,
+    required this.message,
+    required this.actionLabel,
+    required this.onAction,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 64, color: theme.colorScheme.primary),
+            const SizedBox(height: 16),
+            Text(title, style: theme.textTheme.headlineSmall),
+            const SizedBox(height: 8),
+            Text(message, textAlign: TextAlign.center),
+            const SizedBox(height: 24),
+            ElevatedButton(onPressed: onAction, child: Text(actionLabel)),
+          ],
+        ),
+      ),
     );
   }
 }

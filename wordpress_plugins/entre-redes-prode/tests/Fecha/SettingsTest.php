@@ -120,4 +120,43 @@ class SettingsTest extends TestCase {
         $settings = new Settings( $wpdb );
         $this->assertSame( 48, $settings->lockHoursBefore() );
     }
+
+    // -------------------------------------------------------------------------
+    // lock_hours_before default must not drift from InitialSchema::SEED_DEFAULTS
+    // -------------------------------------------------------------------------
+
+    /**
+     * Guards against the two-sources-of-truth mistake: InitialSchema::SEED_DEFAULTS
+     * and Settings::lockHoursBefore()'s fallback used to be two separate '24'
+     * literals in two different files, free to silently drift apart. Asserted
+     * against source (not just behaviour) because both literals still happen to
+     * agree today — a value comparison alone would pass whether or not Settings
+     * actually reads from the shared constant (mirrors
+     * SettingsKeyConsistencyTest::test_the_save_loop_uses_the_shared_key_list).
+     */
+    public function test_lock_hours_before_reads_default_from_seed_defaults_constant(): void {
+        $source = (string) file_get_contents(
+            ( new \ReflectionClass( Settings::class ) )->getFileName()
+        );
+
+        $this->assertStringContainsString(
+            "InitialSchema::SEED_DEFAULTS['lock_hours_before']",
+            $source,
+            'Settings::lockHoursBefore() must read its default from InitialSchema::SEED_DEFAULTS, not a hardcoded literal.'
+        );
+    }
+
+    /**
+     * Behavioural companion to the source-text guard above: the two values must
+     * actually agree numerically (belt-and-suspenders).
+     */
+    public function test_lock_hours_before_default_matches_seeded_default(): void {
+        global $wpdb;
+        $settings = new Settings( $wpdb );
+
+        $this->assertSame(
+            (int) InitialSchema::SEED_DEFAULTS['lock_hours_before'],
+            $settings->lockHoursBefore()
+        );
+    }
 }

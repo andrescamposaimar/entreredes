@@ -61,3 +61,9 @@ build?*/
 # Duplicados de CocoaPods
 ios/Pods */
 ios/Podfile *.lock
+
+# Artefactos de build de plugins WordPress: se regeneran desde el codigo fuente
+wordpress_plugins/*.zip
+
+# Volcados SQL generados para el alta de partidos: se regeneran cuando hacen falta
+alta_partidos_*.sql

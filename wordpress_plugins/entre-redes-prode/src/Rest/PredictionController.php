@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace EntreRedes\Prode\Rest;
 
+use EntreRedes\Prode\Audit\AuditLogger;
 use EntreRedes\Prode\Auth\AuthMiddleware;
 use EntreRedes\Prode\Fecha\FechaRepository;
 use EntreRedes\Prode\Fecha\Settings;
@@ -28,6 +29,14 @@ use EntreRedes\Prode\Predictions\PredictionRepository;
  *   Read prode_fechas.locked_at immediately before writing and compare against
  *   current_time('mysql') to minimize the TOCTOU window. The UNIQUE KEY on
  *   prode_predictions is the final safety net.
+ *
+ * Audit logging:
+ *   Every outcome — the accepted write AND every rejection (missing_field,
+ *   invalid_score, match_not_found, fecha_locked) — is logged via AuditLogger
+ *   (see AuditLogger::logPredictionSubmitted / logPredictionRejected). Before
+ *   this, there was no record of what a user submitted or why a submission
+ *   was rejected. No raw DNI is ever logged here (there is none involved in
+ *   this endpoint); only user_id identifies the actor.
  */
 class PredictionController {
 
@@ -36,15 +45,18 @@ class PredictionController {
     private PredictionRepository $predRepo;
     private FechaRepository      $fechaRepo;
     private AuthMiddleware       $middleware;
+    private AuditLogger          $auditLogger;
 
     public function __construct(
         PredictionRepository $predRepo,
         FechaRepository $fechaRepo,
-        AuthMiddleware $middleware
+        AuthMiddleware $middleware,
+        AuditLogger $auditLogger
     ) {
-        $this->predRepo   = $predRepo;
-        $this->fechaRepo  = $fechaRepo;
-        $this->middleware = $middleware;
+        $this->predRepo    = $predRepo;
+        $this->fechaRepo   = $fechaRepo;
+        $this->middleware  = $middleware;
+        $this->auditLogger = $auditLogger;
     }
 
     /**
@@ -90,6 +102,14 @@ class PredictionController {
      * @return \WP_REST_Response
      */
     public function submitPrediction( \WP_REST_Request $request ): \WP_REST_Response {
+        // The permission_callback (requireAuth) has already run by the time this
+        // handler is reached, so _prode_user is guaranteed present. Extracted
+        // here (rather than just before the upsert, as before) so every
+        // rejection branch below can attribute its audit log entry to a user,
+        // not just the final success path.
+        $user   = $request->get_param( '_prode_user' );
+        $userId = (int) ( $user['id'] ?? 0 );
+
         // 1. Parse and validate required fields.
         $fechaId   = $request->get_param( 'fecha_id' );
         $matchId   = $request->get_param( 'match_id' );
@@ -105,6 +125,14 @@ class PredictionController {
 
         foreach ( $requiredFields as $field => $value ) {
             if ( null === $value ) {
+                $this->auditLogger->logPredictionRejected(
+                    $userId,
+                    'missing_field',
+                    $fechaId,
+                    $matchId,
+                    $scoreHome,
+                    $scoreAway
+                );
                 return $this->error400(
                     'missing_field',
                     "Required field '{$field}' is missing."
@@ -114,12 +142,14 @@ class PredictionController {
 
         // 2. Validate score_home and score_away: must be integers in [0, 255].
         if ( ! $this->isValidScore( $scoreHome ) ) {
+            $this->auditLogger->logPredictionRejected( $userId, 'invalid_score', $fechaId, $matchId, $scoreHome, $scoreAway );
             return $this->error400(
                 'invalid_score',
                 'score_home must be an integer between 0 and 255.'
             );
         }
         if ( ! $this->isValidScore( $scoreAway ) ) {
+            $this->auditLogger->logPredictionRejected( $userId, 'invalid_score', $fechaId, $matchId, $scoreHome, $scoreAway );
             return $this->error400(
                 'invalid_score',
                 'score_away must be an integer between 0 and 255.'
@@ -136,6 +166,7 @@ class PredictionController {
         $activeFecha = $this->loadActiveFecha( $tenantId, $fechaIdInt );
 
         if ( null === $activeFecha ) {
+            $this->auditLogger->logPredictionRejected( $userId, 'match_not_found', $fechaIdInt, $matchIdInt, $scoreHomeInt, $scoreAwayInt );
             return $this->error400( 'match_not_found', 'No active fecha found for the given fecha_id.' );
         }
 
@@ -143,6 +174,7 @@ class PredictionController {
         $matchIds = array_map( 'intval', $matchIds );
 
         if ( ! in_array( $matchIdInt, $matchIds, true ) ) {
+            $this->auditLogger->logPredictionRejected( $userId, 'match_not_found', $fechaIdInt, $matchIdInt, $scoreHomeInt, $scoreAwayInt );
             return $this->error400( 'match_not_found', 'The given match_id does not belong to the active fecha.' );
         }
 
@@ -151,6 +183,7 @@ class PredictionController {
         $now      = current_time( 'mysql' );
 
         if ( $now >= $lockedAt ) {
+            $this->auditLogger->logPredictionRejected( $userId, 'fecha_locked', $fechaIdInt, $matchIdInt, $scoreHomeInt, $scoreAwayInt );
             return new \WP_REST_Response(
                 [
                     'code'    => 'fecha_locked',
@@ -162,10 +195,7 @@ class PredictionController {
         }
 
         // 5. Upsert the prediction.
-        $user   = $request->get_param( '_prode_user' );
-        $userId = (int) ( $user['id'] ?? 0 );
-
-        $this->predRepo->upsert(
+        $wasInsert = $this->predRepo->upsert(
             $userId,
             $fechaIdInt,
             $matchIdInt,
@@ -173,6 +203,8 @@ class PredictionController {
             $scoreAwayInt,
             $lockedAt
         );
+
+        $this->auditLogger->logPredictionSubmitted( $userId, $fechaIdInt, $matchIdInt, $scoreHomeInt, $scoreAwayInt, $wasInsert );
 
         return new \WP_REST_Response( [ 'status' => 'ok' ], 200 );
     }
