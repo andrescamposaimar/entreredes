@@ -25,12 +25,21 @@ dependencies:
   google_sign_in: ^6.2.1
   sign_in_with_apple: ^6.1.0
   firebase_crashlytics: ^4.3.10
+  # Imported directly by lib/services/prode_auth_state.dart. Version is pinned by
+  # the Flutter SDK, so an explicit constraint would only cause resolution conflicts.
+  meta: any
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_launcher_icons: ^0.13.1
   flutter_native_splash: ^2.4.7
+  flutter_lints: ^6.0.0
+  # Imported directly by tests to stub platform channels. Both are transitive
+  # dependencies of firebase_core / flutter_secure_storage, which pin their
+  # versions; constraining them here would break on every parent bump.
+  firebase_core_platform_interface: any
+  flutter_secure_storage_platform_interface: any
 
 flutter:
   uses-material-design: true
